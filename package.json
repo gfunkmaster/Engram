@@ -9,6 +9,7 @@
     "remember": "tsx scripts/remember.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.51.0",
     "@huggingface/transformers": "^3.0.0",
     "better-sqlite3": "^9.4.3",
     "sqlite-vec": "^0.1.6"

@@ -19,11 +19,13 @@ Engram fills that gap.
 ## How It Works
 
 ```
-Session 1  →  work happens  →  remember.ts saves the learning
-Session 2  →  search.ts finds it  →  Claude already knows
+You type a prompt
+  → on-prompt.ts searches memory → relevant context injected silently
+  → Claude responds
+  → on-stop.ts checks response for learnings → saves automatically
 ```
 
-Three scripts. No servers. No API keys. Works on any machine.
+Fully automatic in both directions. You just work.
 
 - **Markdown** is the source of truth — human-readable, git-tracked, portable forever
 - **sqlite-vec** is the search layer — a single `.db` file, no server process
@@ -111,11 +113,9 @@ memory/raw/
 
 ---
 
-## Automatic Mode — Claude Code Hook
+## Automatic Mode — Claude Code Hooks
 
-Wire up the `UserPromptSubmit` hook and Engram runs automatically on every prompt. No manual search, no extra commands — Claude arrives pre-loaded with relevant memory before it even starts thinking.
-
-Add this to your `~/.claude/settings.json`:
+Two hooks make Engram fully automatic. Add both to `~/.claude/settings.json`:
 
 ```json
 {
@@ -130,18 +130,42 @@ Add this to your `~/.claude/settings.json`:
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx tsx /path/to/Engram/hooks/on-stop.ts"
+          }
+        ]
+      }
     ]
   }
 }
 ```
 
-**How it works:**
-1. You type a prompt
-2. `hooks/on-prompt.ts` fires, embeds your prompt, searches memory
-3. If relevant results are found (distance < 0.5), they're injected as context above your message
-4. Claude sees your prompt + relevant memory — you see nothing extra
+### `hooks/on-prompt.ts` — auto-search (on every prompt)
 
-**It fails silently.** If the DB doesn't exist, the prompt is too short, or anything throws — Claude gets your message unmodified. It never blocks.
+1. Embeds your prompt locally
+2. Searches memory for relevant past learnings
+3. Injects matches as silent context before Claude sees your message
+4. Exits in milliseconds if nothing relevant found
+
+### `hooks/on-stop.ts` — auto-remember (after every response)
+
+1. Reads Claude's last response from the session transcript
+2. Runs a fast signal-phrase check (`"turns out"`, `"root cause"`, `"the gotcha"`, etc.)
+3. If no signals → exits immediately, zero cost
+4. If signals found → sends response to Claude Haiku: *"is this worth saving?"*
+5. If yes → checks for duplicates → embeds → saves to `memory/raw/` → indexes
+
+**Both hooks fail silently.** Nothing ever blocks Claude or surfaces errors to you.
+
+### Why Haiku for the judgment call
+
+Haiku is fast (~1-2s) and costs ~$0.0001 per call. Most responses get filtered by the signal-phrase check and never reach Haiku. For the ones that do, Haiku has the judgment to distinguish a genuine learning from routine output — something no regex can do reliably.
 
 ---
 
@@ -177,7 +201,7 @@ Over time, Claude arrives at each session pre-loaded with everything it has lear
 }
 ```
 
-Pure TypeScript. No Python. No external services. No API keys for memory.
+Pure TypeScript. No Python. The `@anthropic-ai/sdk` is only used by `on-stop.ts` for the Haiku judgment call — your existing `ANTHROPIC_API_KEY` from Claude Code covers it.
 
 ---
 
