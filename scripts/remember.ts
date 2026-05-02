@@ -13,11 +13,12 @@ import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import { pipeline } from '@huggingface/transformers';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
-import { join } from 'path';
-import { homedir } from 'os';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 
-const RAW_DIR = join(homedir(), '.claude', 'memory', 'raw');
-const DB_PATH = join(homedir(), '.claude', 'memory', 'memory.db');
+const ENGRAM_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
+const RAW_DIR = join(ENGRAM_DIR, 'memory', 'raw');
+const DB_PATH = join(ENGRAM_DIR, 'memory', 'memory.db');
 const MODEL = 'Xenova/all-MiniLM-L6-v2';
 const CHUNK_SIZE = 512;
 

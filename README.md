@@ -111,6 +111,40 @@ memory/raw/
 
 ---
 
+## Automatic Mode — Claude Code Hook
+
+Wire up the `UserPromptSubmit` hook and Engram runs automatically on every prompt. No manual search, no extra commands — Claude arrives pre-loaded with relevant memory before it even starts thinking.
+
+Add this to your `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx tsx /path/to/Engram/hooks/on-prompt.ts"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**How it works:**
+1. You type a prompt
+2. `hooks/on-prompt.ts` fires, embeds your prompt, searches memory
+3. If relevant results are found (distance < 0.5), they're injected as context above your message
+4. Claude sees your prompt + relevant memory — you see nothing extra
+
+**It fails silently.** If the DB doesn't exist, the prompt is too short, or anything throws — Claude gets your message unmodified. It never blocks.
+
+---
+
 ## Integration with Claude Code Skills
 
 Skills call Engram at two points in every pipeline:
