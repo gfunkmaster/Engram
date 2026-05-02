@@ -1,0 +1,6 @@
+node_modules/
+dist/
+memory/memory.db
+memory/raw/*
+!memory/raw/.gitkeep
+.DS_Store
