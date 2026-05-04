@@ -2,13 +2,11 @@
 /**
  * Claude Code UserPromptSubmit hook — auto-search.
  * Searches Engram memory on every prompt and injects relevant context.
- * Exits silently if nothing relevant found. Never blocks Claude.
+ * Threshold raised to 0.75 — only inject high-confidence matches.
+ * Logs injected count to stderr for visibility. Never blocks Claude.
  */
 
-import { existsSync } from 'fs';
-import { search } from '../lib/memory.ts';
-
-const RELEVANCE_THRESHOLD = 0.5;
+import { search, INJECTION_THRESHOLD } from '../lib/memory.ts';
 
 async function main(): Promise<void> {
   const chunks: Buffer[] = [];
@@ -21,9 +19,12 @@ async function main(): Promise<void> {
   if (prompt.length < 20) return;
 
   try {
-    const results = await search(prompt, 3);
-    const relevant = results.filter(r => r.distance < RELEVANCE_THRESHOLD);
+    const results = await search(prompt, 5);
+    const relevant = results.filter(r => r.distance < INJECTION_THRESHOLD);
     if (relevant.length === 0) return;
+
+    // Visibility — user sees this in Claude Code's hook output
+    process.stderr.write(`[Engram] Injecting ${relevant.length} relevant memory${relevant.length > 1 ? 'ies' : 'y'}\n`);
 
     const lines = [
       '---',
@@ -37,7 +38,7 @@ async function main(): Promise<void> {
     ];
 
     process.stdout.write(lines.join('\n'));
-  } catch { /* silent */ }
+  } catch { /* never block Claude */ }
 }
 
 main();

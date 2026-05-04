@@ -1,7 +1,7 @@
 #!/usr/bin/env tsx
 /**
- * Rebuild the semantic memory index from ~/.claude/memory/raw/
- * Run once on any new machine after cloning your ~/.claude repo.
+ * Rebuild the semantic memory index from memory/raw/.
+ * Run once on any new machine after cloning, or after schema changes.
  *
  * Usage:
  *   npm run reindex
@@ -14,25 +14,20 @@ import { pipeline } from '@huggingface/transformers';
 import { readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { chunkText, serialize } from '../lib/memory.ts';
 
 const ENGRAM_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
 const MEMORY_DIR = join(ENGRAM_DIR, 'memory', 'raw');
 const DB_PATH = join(ENGRAM_DIR, 'memory', 'memory.db');
 const MODEL = 'Xenova/all-MiniLM-L6-v2';
-const CHUNK_SIZE = 512;
 
-interface Memory {
+interface MemoryRow {
   path: string;
   title: string;
   tags: string;
   topic: string;
   chunk: string;
-}
-
-function serialize(vector: number[]): Buffer {
-  const buf = Buffer.allocUnsafe(vector.length * 4);
-  new Float32Array(buf.buffer).set(vector);
-  return buf;
+  session_id: string | null;
 }
 
 function extractFrontmatter(content: string): { meta: Record<string, string>; body: string } {
@@ -56,15 +51,6 @@ function extractFrontmatter(content: string): { meta: Record<string, string>; bo
   return { meta, body };
 }
 
-function chunk(text: string): string[] {
-  const words = text.split(/\s+/);
-  const chunks: string[] = [];
-  for (let i = 0; i < words.length; i += CHUNK_SIZE) {
-    chunks.push(words.slice(i, i + CHUNK_SIZE).join(' '));
-  }
-  return chunks;
-}
-
 function walkMarkdown(dir: string): string[] {
   const files: string[] = [];
   try {
@@ -76,9 +62,7 @@ function walkMarkdown(dir: string): string[] {
         files.push(full);
       }
     }
-  } catch {
-    // directory may not exist yet
-  }
+  } catch { /* directory may not exist yet */ }
   return files;
 }
 
@@ -94,12 +78,18 @@ async function main() {
     DROP TABLE IF EXISTS memories;
 
     CREATE TABLE memories (
-      id    INTEGER PRIMARY KEY,
-      path  TEXT NOT NULL,
-      title TEXT,
-      tags  TEXT,
-      topic TEXT,
-      chunk TEXT NOT NULL
+      id              INTEGER PRIMARY KEY,
+      path            TEXT NOT NULL,
+      title           TEXT,
+      tags            TEXT,
+      topic           TEXT,
+      chunk           TEXT NOT NULL,
+      session_id      TEXT,
+      source_excerpt  TEXT,
+      created_at      INTEGER DEFAULT (unixepoch()),
+      supersedes      INTEGER,
+      superseded_by   INTEGER,
+      is_active       INTEGER DEFAULT 1
     );
 
     CREATE VIRTUAL TABLE memory_embeddings USING vec0(
@@ -108,20 +98,23 @@ async function main() {
     );
   `);
 
-  const insertMemory = db.prepare(
-    'INSERT INTO memories (path, title, tags, topic, chunk) VALUES (?, ?, ?, ?, ?)'
-  );
+  const insertMemory = db.prepare(`
+    INSERT INTO memories (path, title, tags, topic, chunk, session_id, is_active)
+    VALUES (?, ?, ?, ?, ?, ?, 1)
+  `);
   const insertEmbedding = db.prepare(
     'INSERT INTO memory_embeddings (id, embedding) VALUES (?, ?)'
   );
 
   const files = walkMarkdown(MEMORY_DIR);
-  console.log(`Indexing ${files.length} files...`);
+  console.log(`Indexing ${files.length} files...\n`);
 
-  const insertMany = db.transaction(async (memories: Memory[], embeddings: Buffer[]) => {
-    for (let i = 0; i < memories.length; i++) {
-      const m = memories[i];
-      const { lastInsertRowid } = insertMemory.run(m.path, m.title, m.tags, m.topic, m.chunk);
+  const insertBatch = db.transaction((rows: MemoryRow[], embeddings: Buffer[]) => {
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      const { lastInsertRowid } = insertMemory.run(
+        r.path, r.title, r.tags, r.topic, r.chunk, r.session_id
+      );
       insertEmbedding.run(lastInsertRowid, embeddings[i]);
     }
   });
@@ -133,24 +126,24 @@ async function main() {
     const topic = meta['topic'] ?? file.split('/').at(-2) ?? 'general';
     const title = meta['title'] ?? file.split('/').at(-1)?.replace('.md', '') ?? '';
     const tags = meta['tags'] ?? '';
+    const sessionId = meta['session_id'] ?? null;
 
-    const chunks = chunk(body).filter(c => c.trim());
-    const memories: Memory[] = [];
+    const chunks = chunkText(body).filter(c => c.trim());
+    const rows: MemoryRow[] = [];
     const embeddings: Buffer[] = [];
 
     for (const c of chunks) {
       const output = await extractor(c, { pooling: 'mean', normalize: true });
-      const vector = Array.from(output.data as Float32Array);
-      memories.push({ path: relPath, title, tags, topic, chunk: c });
-      embeddings.push(serialize(vector));
+      rows.push({ path: relPath, title, tags, topic, chunk: c, session_id: sessionId });
+      embeddings.push(serialize(Array.from(output.data as Float32Array)));
     }
 
-    await insertMany(memories, embeddings);
-    console.log(`  ✓ ${relPath} (${chunks.length} chunks)`);
+    insertBatch(rows, embeddings);
+    console.log(`  ✓ ${relPath} (${chunks.length} chunk${chunks.length !== 1 ? 's' : ''})`);
   }
 
   db.close();
-  console.log(`\nDone. Index saved to ${DB_PATH}`);
+  console.log(`\nDone. ${files.length} files indexed → ${DB_PATH}`);
 }
 
 main().catch(console.error);

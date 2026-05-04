@@ -2,7 +2,7 @@
 /**
  * Claude Code Stop hook — auto-remember.
  * Reads Claude's last response, runs signal-phrase filter,
- * asks Haiku if it's worth saving, saves if yes.
+ * asks Haiku if it's worth saving, saves with provenance if yes.
  * Never outputs to stdout. Never blocks Claude. Fails silently.
  */
 
@@ -35,13 +35,19 @@ async function main(): Promise<void> {
   if (!raw) return;
 
   let transcriptPath = '';
-  try { transcriptPath = JSON.parse(raw).transcript_path ?? ''; } catch { return; }
+  let sessionId = '';
+  try {
+    const input = JSON.parse(raw);
+    transcriptPath = input.transcript_path ?? '';
+    sessionId = input.session_id ?? '';
+  } catch { return; }
+
   if (!transcriptPath || !existsSync(transcriptPath)) return;
 
   const lastResponse = getLastAssistantMessage(transcriptPath);
   const topic = getTopicFromGit();
 
-  await autoRemember(lastResponse, topic);
+  await autoRemember(lastResponse, topic, sessionId);
 }
 
 main().catch(() => {});
