@@ -1,0 +1,92 @@
+/**
+ * Engram-aware Anthropic client wrapper.
+ *
+ * Drop-in replacement for the Anthropic client. Every message.create call
+ * automatically searches memory before the request and auto-remembers after.
+ *
+ * Usage:
+ *   import { EngramClient } from './lib/engram-client.ts';
+ *   const client = new EngramClient();
+ *   const response = await client.messages.create({ ... }); // same API
+ */
+
+import Anthropic from '@anthropic-ai/sdk';
+import { search, autoRemember } from './memory.ts';
+import type { SearchResult } from './memory.ts';
+
+type MessageCreateParams = Parameters<Anthropic['messages']['create']>[0];
+type MessageResponse = Awaited<ReturnType<Anthropic['messages']['create']>>;
+
+function formatMemories(memories: SearchResult[]): string {
+  return memories
+    .map(m => `**${m.title}** (${m.topic})\n${m.chunk.slice(0, 300)}`)
+    .join('\n\n');
+}
+
+function extractUserQuery(params: MessageCreateParams): string {
+  const messages = params.messages ?? [];
+  const lastUser = [...messages].reverse().find(m => m.role === 'user');
+  if (!lastUser) return '';
+  if (typeof lastUser.content === 'string') return lastUser.content;
+  if (Array.isArray(lastUser.content)) {
+    return lastUser.content
+      .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+      .map(b => b.text)
+      .join(' ');
+  }
+  return '';
+}
+
+function extractResponseText(response: MessageResponse): string {
+  if (!('content' in response)) return '';
+  return response.content
+    .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+    .map(b => b.text)
+    .join('\n');
+}
+
+export class EngramClient {
+  private client: Anthropic;
+
+  constructor(options?: ConstructorParameters<typeof Anthropic>[0]) {
+    this.client = new Anthropic(options);
+  }
+
+  messages = {
+    create: async (params: MessageCreateParams): Promise<MessageResponse> => {
+      const query = extractUserQuery(params);
+
+      // 1. Search memory and inject as system context
+      let enrichedParams = { ...params };
+      if (query.length > 20) {
+        try {
+          const memories = await search(query, 3);
+          const relevant = memories.filter(m => m.distance < 0.5);
+
+          if (relevant.length > 0) {
+            const memoryContext = `## Relevant context from Engram memory\n\n${formatMemories(relevant)}\n\n---\n\n`;
+            const existingSystem = typeof params.system === 'string' ? params.system : '';
+            enrichedParams = {
+              ...params,
+              system: memoryContext + existingSystem,
+            };
+          }
+        } catch { /* never block on memory failure */ }
+      }
+
+      // 2. Call Claude
+      const response = await this.client.messages.create(enrichedParams) as MessageResponse;
+
+      // 3. Auto-remember in background — fire and forget
+      const responseText = extractResponseText(response);
+      autoRemember(responseText).catch(() => {});
+
+      return response;
+    },
+  };
+}
+
+/** Factory function for simpler instantiation. */
+export function createEngramClient(options?: ConstructorParameters<typeof Anthropic>[0]): EngramClient {
+  return new EngramClient(options);
+}
