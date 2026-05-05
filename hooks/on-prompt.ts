@@ -4,9 +4,13 @@
  * Searches Engram memory on every prompt and injects relevant context.
  * Threshold raised to 0.75 — only inject high-confidence matches.
  * Logs injected count to stderr for visibility. Never blocks Claude.
+ *
+ * Uses the daemon client for search — if the daemon is running the model
+ * stays warm (fast); if not, falls back to direct execution.
  */
 
-import { search, INJECTION_THRESHOLD } from '../lib/memory.ts';
+import { INJECTION_THRESHOLD } from '../lib/memory.ts';
+import { daemonSearch } from '../daemon/client.ts';
 
 async function main(): Promise<void> {
   const chunks: Buffer[] = [];
@@ -19,7 +23,7 @@ async function main(): Promise<void> {
   if (prompt.length < 20) return;
 
   try {
-    const results = await search(prompt, 5);
+    const results = await daemonSearch(prompt, 5);
     const relevant = results.filter(r => r.distance < INJECTION_THRESHOLD);
     if (relevant.length === 0) return;
 

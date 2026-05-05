@@ -10,13 +10,14 @@
  *   npm run decay               # dry-run — shows what would change
  *   npm run decay -- --apply    # write changes to the DB
  *   npm run decay -- --cutoff 0.05   # custom deactivation cutoff
+ *   npm run decay -- --apply --rate 0.005  # override per-memory decay_rate globally
  */
 
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
-import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
-import { DB_PATH } from '../lib/memory.ts';
+import { readFileSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { DB_PATH, RAW_DIR } from '../lib/memory.ts';
 
 const DEACTIVATE_CUTOFF = 0.10;
 
@@ -33,6 +34,7 @@ interface MemoryRow {
   id: number;
   title: string;
   topic: string;
+  path: string;
   project_scope: string | null;
   confidence: number;
   decay_rate: number;
@@ -40,11 +42,25 @@ interface MemoryRow {
   created_at: number;
 }
 
+// Task 4: update markdown frontmatter when applying decay
+function _updateMarkdownConfidence(relPath: string, confidence: number, accessCount: number): void {
+  try {
+    const fullPath = join(RAW_DIR, relPath);
+    let content = readFileSync(fullPath, 'utf-8');
+    content = content.replace(/^confidence:.*$/m, `confidence: ${confidence.toFixed(4)}`);
+    content = content.replace(/^access_count:.*$/m, `access_count: ${accessCount}`);
+    writeFileSync(fullPath, content, 'utf-8');
+  } catch { /* skip if file not found */ }
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const apply = args.includes('--apply');
   const cutoffIdx = args.indexOf('--cutoff');
   const cutoff = cutoffIdx !== -1 ? parseFloat(args[cutoffIdx + 1]) : DEACTIVATE_CUTOFF;
+  // Task 25: --rate flag to override per-memory decay_rate globally
+  const rateIdx = args.indexOf('--rate');
+  const globalRate = rateIdx !== -1 ? parseFloat(args[rateIdx + 1]) : null;
 
   if (!apply) {
     console.log(`\n${YELLOW}Dry-run mode — pass --apply to commit changes${RESET}\n`);
@@ -54,7 +70,7 @@ async function main() {
   sqliteVec.load(db);
 
   const memories = db.prepare(`
-    SELECT id, title, topic, project_scope, confidence, decay_rate, access_count, created_at
+    SELECT id, title, topic, path, project_scope, confidence, decay_rate, access_count, created_at
     FROM memories
     WHERE is_active = 1
       AND memory_tier = 'short'
@@ -71,10 +87,15 @@ async function main() {
   let deactivated = 0;
 
   console.log(`\n${BOLD}Short-term memory decay report${RESET}\n`);
-  console.log(`${DIM}Deactivation cutoff: ${cutoff} | Processing ${memories.length} memories${RESET}\n`);
+  console.log(`${DIM}Deactivation cutoff: ${cutoff} | Processing ${memories.length} memories${RESET}`);
+  if (globalRate !== null) {
+    console.log(`${DIM}Using global rate override: ${globalRate}${RESET}`);
+  }
+  console.log();
 
   for (const m of memories) {
-    const newConfidence = m.confidence * (1 - m.decay_rate);
+    const effectiveRate = globalRate !== null ? globalRate : m.decay_rate;
+    const newConfidence = m.confidence * (1 - effectiveRate);
     const willDeactivate = newConfidence < cutoff;
 
     if (willDeactivate) {
@@ -82,6 +103,7 @@ async function main() {
       console.log(`  ${DIM}confidence: ${m.confidence.toFixed(3)} → ${newConfidence.toFixed(3)} [DEACTIVATE]${RESET}`);
       if (apply) {
         db.prepare('UPDATE memories SET confidence = ?, is_active = 0 WHERE id = ?').run(newConfidence, m.id);
+        _updateMarkdownConfidence(m.path, newConfidence, m.access_count);
       }
       deactivated++;
     } else {
@@ -90,6 +112,7 @@ async function main() {
       console.log(`  ${bar}  ${m.confidence.toFixed(3)} → ${newConfidence.toFixed(3)}  ${DIM}${m.title} · ${age}d old${RESET}`);
       if (apply) {
         db.prepare('UPDATE memories SET confidence = ? WHERE id = ?').run(newConfidence, m.id);
+        _updateMarkdownConfidence(m.path, newConfidence, m.access_count);
       }
       decayed++;
     }

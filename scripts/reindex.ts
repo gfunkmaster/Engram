@@ -2,6 +2,7 @@
 /**
  * Rebuild the semantic memory index from memory/raw/.
  * Run once on any new machine after cloning, or after schema changes.
+ * Uses upsert logic — unchanged files are skipped, preserving access_count and confidence.
  *
  * Usage:
  *   npm run reindex
@@ -10,11 +11,13 @@
 
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
+import { createHash } from 'crypto';
 import { pipeline } from '@huggingface/transformers';
 import { readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { chunkText, serialize } from '../lib/memory.ts';
+import { ensureSchema } from '../lib/migrate.ts';
 import type { MemoryTier } from '../lib/memory.ts';
 
 const ENGRAM_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -22,6 +25,7 @@ const MEMORY_DIR = join(ENGRAM_DIR, 'memory', 'raw');
 const DB_PATH = join(ENGRAM_DIR, 'memory', 'memory.db');
 const MODEL = 'Xenova/all-MiniLM-L6-v2';
 
+// Task 11: include confidence and access_count in MemoryRow
 interface MemoryRow {
   path: string;
   title: string;
@@ -31,6 +35,9 @@ interface MemoryRow {
   session_id: string | null;
   memory_tier: MemoryTier;
   project_scope: string | null;
+  confidence: number;
+  access_count: number;
+  file_hash: string;
 }
 
 function extractFrontmatter(content: string): { meta: Record<string, string>; body: string } {
@@ -60,6 +67,8 @@ function walkMarkdown(dir: string): string[] {
     for (const entry of readdirSync(dir)) {
       const full = join(dir, entry);
       if (statSync(full).isDirectory()) {
+        // Task 12: skip _purged directory
+        if (entry === '_purged') continue;
         files.push(...walkMarkdown(full));
       } else if (entry.endsWith('.md')) {
         files.push(full);
@@ -76,11 +85,12 @@ async function main() {
   const db = new Database(DB_PATH);
   sqliteVec.load(db);
 
-  db.exec(`
-    DROP TABLE IF EXISTS memory_embeddings;
-    DROP TABLE IF EXISTS memories;
+  // Task 13: run schema migrations before any table operations
+  ensureSchema(db);
 
-    CREATE TABLE memories (
+  // Task 12: CREATE TABLE IF NOT EXISTS instead of DROP + recreate
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS memories (
       id              INTEGER PRIMARY KEY,
       path            TEXT NOT NULL,
       title           TEXT,
@@ -98,19 +108,22 @@ async function main() {
       confidence      REAL DEFAULT 1.0,
       decay_rate      REAL DEFAULT 0.02,
       access_count    INTEGER DEFAULT 0,
-      last_accessed_at INTEGER
+      last_accessed_at INTEGER,
+      file_hash       TEXT
     );
 
-    CREATE VIRTUAL TABLE memory_embeddings USING vec0(
+    CREATE VIRTUAL TABLE IF NOT EXISTS memory_embeddings USING vec0(
       id        INTEGER PRIMARY KEY,
       embedding float[384]
     );
   `);
 
+  // Task 11: INSERT includes confidence and access_count
   const insertMemory = db.prepare(`
     INSERT INTO memories
-      (path, title, tags, topic, chunk, session_id, is_active, memory_tier, project_scope)
-    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+      (path, title, tags, topic, chunk, session_id, is_active, memory_tier, project_scope,
+       confidence, access_count, file_hash)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
   `);
   const insertEmbedding = db.prepare(
     'INSERT INTO memory_embeddings (id, embedding) VALUES (?, ?)'
@@ -119,27 +132,59 @@ async function main() {
   const files = walkMarkdown(MEMORY_DIR);
   console.log(`Indexing ${files.length} files...\n`);
 
+  // Task 12: upsert — check file_hash before processing
   const insertBatch = db.transaction((rows: MemoryRow[], embeddings: Buffer[]) => {
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
       const { lastInsertRowid } = insertMemory.run(
         r.path, r.title, r.tags, r.topic, r.chunk, r.session_id,
-        r.memory_tier, r.project_scope
+        r.memory_tier, r.project_scope, r.confidence, r.access_count, r.file_hash
       );
       insertEmbedding.run(lastInsertRowid, embeddings[i]);
     }
   });
 
+  const deleteByPath = db.prepare('DELETE FROM memory_embeddings WHERE id IN (SELECT id FROM memories WHERE path = ?)');
+  const deleteMemoryByPath = db.prepare('DELETE FROM memories WHERE path = ?');
+  const getExistingHash = db.prepare('SELECT file_hash FROM memories WHERE path = ? LIMIT 1');
+
+  let skipped = 0;
+  let updated = 0;
+  let inserted = 0;
+
   for (const file of files) {
     const content = readFileSync(file, 'utf-8');
-    const { meta, body } = extractFrontmatter(content);
     const relPath = relative(MEMORY_DIR, file);
+
+    // Task 12: compute SHA-256 hash of file content
+    const fileHash = createHash('sha256').update(content).digest('hex');
+
+    // Check if unchanged
+    const existing = getExistingHash.get(relPath) as { file_hash: string | null } | undefined;
+    if (existing) {
+      if (existing.file_hash === fileHash) {
+        console.log(`  ↩ ${relPath} (unchanged, skipped)`);
+        skipped++;
+        continue;
+      }
+      // File changed — delete old rows, then reinsert
+      deleteByPath.run(relPath);
+      deleteMemoryByPath.run(relPath);
+      updated++;
+    } else {
+      inserted++;
+    }
+
+    const { meta, body } = extractFrontmatter(content);
     const topic = meta['topic'] ?? file.split('/').at(-2) ?? 'general';
     const title = meta['title'] ?? file.split('/').at(-1)?.replace('.md', '') ?? '';
     const tags = meta['tags'] ?? '';
     const sessionId = meta['session_id'] ?? null;
     const tier = (meta['tier'] === 'long' ? 'long' : 'short') as MemoryTier;
     const projectScope = meta['project_scope'] ? meta['project_scope'] : null;
+    // Task 11: read confidence and access_count from frontmatter with defaults
+    const confidence = meta['confidence'] ? parseFloat(meta['confidence']) : 1.0;
+    const accessCount = meta['access_count'] ? parseInt(meta['access_count'], 10) : 0;
 
     const chunks = chunkText(body).filter(c => c.trim());
     const rows: MemoryRow[] = [];
@@ -147,17 +192,22 @@ async function main() {
 
     for (const c of chunks) {
       const output = await extractor(c, { pooling: 'mean', normalize: true });
-      rows.push({ path: relPath, title, tags, topic, chunk: c, session_id: sessionId, memory_tier: tier, project_scope: projectScope });
+      rows.push({
+        path: relPath, title, tags, topic, chunk: c, session_id: sessionId,
+        memory_tier: tier, project_scope: projectScope,
+        confidence, access_count: accessCount, file_hash: fileHash,
+      });
       embeddings.push(serialize(Array.from(output.data as Float32Array)));
     }
 
     insertBatch(rows, embeddings);
     const tierLabel = tier === 'long' ? '[long]' : '[short]';
-    console.log(`  ✓ ${relPath} ${tierLabel} (${chunks.length} chunk${chunks.length !== 1 ? 's' : ''})`);
+    const action = existing ? '↻' : '✓';
+    console.log(`  ${action} ${relPath} ${tierLabel} (${chunks.length} chunk${chunks.length !== 1 ? 's' : ''})`);
   }
 
   db.close();
-  console.log(`\nDone. ${files.length} files indexed → ${DB_PATH}`);
+  console.log(`\nDone. ${inserted} inserted, ${updated} updated, ${skipped} skipped → ${DB_PATH}`);
 }
 
 main().catch(console.error);

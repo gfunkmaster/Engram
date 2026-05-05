@@ -9,7 +9,12 @@
     "remember": "tsx scripts/remember.ts",
     "why": "tsx scripts/why.ts",
     "promote": "tsx scripts/promote.ts",
-    "decay": "tsx scripts/decay.ts"
+    "decay": "tsx scripts/decay.ts",
+    "migrate": "tsx scripts/migrate.ts",
+    "purge": "tsx scripts/purge.ts",
+    "status": "tsx scripts/status.ts",
+    "daemon": "tsx daemon/server.ts",
+    "test": "vitest run tests/"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.51.0",
@@ -21,6 +26,7 @@
     "@types/better-sqlite3": "^7.6.8",
     "@types/node": "^20.0.0",
     "tsx": "^4.7.0",
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "vitest": "^1.0.0"
   }
 }

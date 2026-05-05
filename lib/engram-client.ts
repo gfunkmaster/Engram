@@ -11,7 +11,7 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
-import { search, autoRemember } from './memory.ts';
+import { search, autoRemember, getProjectScope, INJECTION_THRESHOLD } from './memory.ts';
 import type { SearchResult } from './memory.ts';
 
 type MessageCreateParams = Parameters<Anthropic['messages']['create']>[0];
@@ -40,8 +40,8 @@ function extractUserQuery(params: MessageCreateParams): string {
 function extractResponseText(response: MessageResponse): string {
   if (!('content' in response)) return '';
   return response.content
-    .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-    .map(b => b.text)
+    .filter(b => b.type === 'text')
+    .map(b => (b as { type: 'text'; text: string }).text)
     .join('\n');
 }
 
@@ -61,7 +61,8 @@ export class EngramClient {
       if (query.length > 20) {
         try {
           const memories = await search(query, 3);
-          const relevant = memories.filter(m => m.distance < 0.5);
+          // Task 5: use INJECTION_THRESHOLD from memory.ts instead of hardcoded 0.5
+          const relevant = memories.filter(m => m.distance < INJECTION_THRESHOLD);
 
           if (relevant.length > 0) {
             const memoryContext = `## Relevant context from Engram memory\n\n${formatMemories(relevant)}\n\n---\n\n`;
@@ -79,7 +80,8 @@ export class EngramClient {
 
       // 3. Auto-remember in background — fire and forget
       const responseText = extractResponseText(response);
-      autoRemember(responseText).catch(() => {});
+      // Task 8: pass projectScope so autoRemember is properly scoped
+      autoRemember(responseText, undefined, undefined, getProjectScope()).catch(() => {});
 
       return response;
     },

@@ -113,9 +113,15 @@ npm run promote -- --min 5 # custom access threshold
 npm run decay              # dry-run: shows confidence bars and what would be deactivated
 npm run decay -- --apply   # commit the decay
 npm run decay -- --cutoff 0.05  # custom deactivation cutoff
+npm run decay -- --apply --rate 0.005  # override per-memory decay_rate globally
 ```
 
-Run `decay` on a schedule (weekly is typical) to let stale project-specific memories fade out.
+**Run frequency and calibration:**
+
+- **Daily cron (recommended):** `0 0 * * * cd /path/to/Engram && npm run decay -- --apply`
+- The default `decay_rate = 0.02` is calibrated for daily runs — a memory at 1.0 confidence reaches the 0.10 deactivation cutoff in ~115 days without being accessed.
+- **If running weekly:** use a lower rate — pass `--rate 0.005` or manually set `decay_rate` to `0.005` in a memory's frontmatter. At weekly intervals, `0.005` gives a similar 115-day window.
+- **Recommended order:** promote first, then decay: `npm run promote -- --apply && npm run decay -- --apply`
 
 ### Rebuild the full index
 
@@ -129,12 +135,15 @@ npm run reindex
 
 | Script | Command | Purpose |
 |---|---|---|
-| `reindex.ts` | `npm run reindex` | Rebuild vector index from all markdown files |
+| `reindex.ts` | `npm run reindex` | Rebuild vector index from all markdown files (upsert — unchanged files are skipped) |
 | `search.ts` | `npm run search -- "<query>"` | Semantic search over memory |
 | `remember.ts` | `npm run remember -- --topic ... --title ...` | Write and immediately index a new memory |
 | `why.ts` | `npm run why -- "<query>"` | Debug retrieval pipeline — shows distances, tiers, and filter reasons |
 | `promote.ts` | `npm run promote` | Promote eligible short-term memories to long-term |
 | `decay.ts` | `npm run decay` | Apply confidence decay to short-term memories |
+| `migrate.ts` | `npm run migrate` | Apply incremental schema migrations to the DB |
+| `purge.ts` | `npm run purge -- --id N` | Purge a memory by ID or semantic query |
+| `status.ts` | `npm run status` | Show system status (counts, DB size, daemon, env vars) |
 
 ---
 
@@ -145,17 +154,26 @@ npm run reindex
 ├── package.json
 ├── tsconfig.json
 ├── lib/
-│   └── memory.ts         ← shared primitives (search, save, embed, chunk)
+│   ├── memory.ts         ← shared primitives (search, save, embed, chunk)
+│   └── migrate.ts        ← schema migration logic
+├── daemon/
+│   ├── server.ts         ← HTTP daemon (keeps model warm, port 7700)
+│   └── client.ts         ← daemon client with direct fallback
 ├── scripts/
 │   ├── reindex.ts
 │   ├── search.ts
 │   ├── remember.ts
 │   ├── why.ts
 │   ├── promote.ts
-│   └── decay.ts
+│   ├── decay.ts
+│   ├── migrate.ts
+│   ├── purge.ts
+│   └── status.ts
 ├── hooks/
 │   ├── on-prompt.ts      ← UserPromptSubmit: auto-search + inject
 │   └── on-stop.ts        ← Stop: auto-remember + save
+├── tests/
+│   └── memory.test.ts    ← vitest unit tests
 └── memory/
     ├── raw/              ← markdown files (git-tracked, source of truth)
     └── memory.db         ← vector index (gitignored, regeneratable)
@@ -188,6 +206,96 @@ Always rotate the refresh token on every use. Reusing the same token is a
 vector for token theft — if the original is stolen, the legitimate user's
 next refresh will fail and alert you.
 ```
+
+---
+
+## Daemon (Recommended)
+
+### The problem
+
+Every time a hook fires, Node.js loads and the embedding model (a ~90 MB ONNX file) is initialised from disk. This cold-start takes 2–5 seconds on most machines — noticeable latency on every prompt.
+
+### The solution
+
+Run the daemon once. It loads the model into memory and keeps it warm, serving search requests over a local HTTP socket. The cold-start disappears. Subsequent searches are near-instant.
+
+### Start the daemon
+
+```bash
+npm run daemon
+```
+
+### Verify it's running
+
+```bash
+curl http://localhost:7700/health
+# → {"status":"ok","pid":12345}
+```
+
+The daemon exits automatically after 30 minutes of inactivity.
+
+### Fallback
+
+If the daemon is not running, the hooks fall back to direct execution automatically — slower (cold-start on every prompt) but still fully functional. No configuration required.
+
+### macOS launchd (auto-start on login)
+
+Save as `~/Library/LaunchAgents/com.engram.daemon.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.engram.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/npx</string>
+    <string>tsx</string>
+    <string>/path/to/Engram/daemon/server.ts</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>StandardErrorPath</key>
+  <string>/tmp/engram-daemon.log</string>
+</dict>
+</plist>
+```
+
+Load it: `launchctl load ~/Library/LaunchAgents/com.engram.daemon.plist`
+
+### Linux systemd (auto-start on login)
+
+Save as `~/.config/systemd/user/engram-daemon.service`:
+
+```ini
+[Unit]
+Description=Engram memory daemon
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/npx tsx /path/to/Engram/daemon/server.ts
+Restart=on-failure
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+```
+
+Enable: `systemctl --user enable --now engram-daemon`
+
+---
+
+## Security & Privacy
+
+- **Auto-remember API calls**: When auto-remember fires, the last Claude response (up to 2,000 characters) is sent to the Anthropic Haiku API to determine if it is worth saving. No other data is sent.
+- **Disable all API calls**: Set `ENGRAM_DISABLE_HAIKU=1` to disable auto-remember entirely. Engram will only save memories you explicitly write with `npm run remember`. No data leaves your machine.
+- **Embeddings are local**: The embedding model (all-MiniLM-L6-v2) runs locally via ONNX. No data leaves your machine for search.
+- **Storage is local**: The DB (`memory/memory.db`) and markdown files (`memory/raw/`) are local only. They are never uploaded anywhere by Engram.
 
 ---
 

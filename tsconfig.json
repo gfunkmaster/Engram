@@ -9,5 +9,5 @@
     "allowImportingTsExtensions": true,
     "noEmit": true
   },
-  "include": ["scripts/**/*.ts"]
+  "include": ["scripts/**/*.ts", "lib/**/*.ts", "hooks/**/*.ts", "daemon/**/*.ts", "tests/**/*.ts"]
 }

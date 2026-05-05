@@ -7,6 +7,8 @@
  */
 
 import { readFileSync, existsSync } from 'fs';
+import { resolve } from 'path';
+import { homedir } from 'os';
 import { autoRemember, getTopicFromGit, getProjectScope } from '../lib/memory.ts';
 
 function getLastAssistantMessage(transcriptPath: string): string {
@@ -42,7 +44,14 @@ async function main(): Promise<void> {
     sessionId = input.session_id ?? '';
   } catch { return; }
 
-  if (!transcriptPath || !existsSync(transcriptPath)) return;
+  if (!transcriptPath) return;
+
+  // Task 7: validate transcript path to prevent path traversal
+  const resolvedPath = resolve(transcriptPath);
+  if (!resolvedPath.startsWith(homedir())) return;
+  transcriptPath = resolvedPath;
+
+  if (!existsSync(transcriptPath)) return;
 
   const lastResponse = getLastAssistantMessage(transcriptPath);
   const topic = getTopicFromGit();

@@ -11,17 +11,19 @@ import { writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
+import { ensureSchema } from './migrate.ts';
 
 const ENGRAM_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
 export const RAW_DIR = join(ENGRAM_DIR, 'memory', 'raw');
 export const DB_PATH = join(ENGRAM_DIR, 'memory', 'memory.db');
 
 const EMBED_MODEL = 'Xenova/all-MiniLM-L6-v2';
-const HAIKU = 'claude-haiku-4-5-20251001';
+// Task 10: allow override via env var
+const HAIKU = process.env.ENGRAM_MODEL ?? 'claude-haiku-4-5-20251001';
 
 // Distance thresholds (cosine distance — lower = more similar)
-const DUPLICATE_THRESHOLD = 0.15;
-const SUPERSESSION_THRESHOLD = 0.35;
+export const DUPLICATE_THRESHOLD = 0.15;
+export const SUPERSESSION_THRESHOLD = 0.35;
 export const INJECTION_THRESHOLD = 0.75;
 
 const MIN_RESPONSE_LENGTH = 200;
@@ -89,6 +91,13 @@ export function hasSignal(text: string): boolean {
   return SIGNAL_PHRASES.some(p => lower.includes(p));
 }
 
+// Task 6: sanitize topic to prevent path traversal
+export function sanitizeTopic(topic: string): string {
+  const sanitized = topic.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  if (!sanitized || sanitized.includes('..')) return 'general';
+  return sanitized;
+}
+
 export function getTopicFromGit(): string {
   try {
     const branch = execSync('git branch --show-current', {
@@ -98,7 +107,8 @@ export function getTopicFromGit(): string {
     if (!branch || branch === 'main' || branch === 'master') return 'general';
     const parts = branch.split('/');
     const slug = parts.length > 1 ? parts[1] : branch;
-    return slug.split('-')[0] || 'general';
+    // Task 6: sanitize the topic slug
+    return sanitizeTopic(slug.split('-')[0]);
   } catch {
     return 'general';
   }
@@ -135,11 +145,36 @@ export function chunkText(text: string, size = 400, overlap = 80): string[] {
       const chunk = words.slice(i, i + size).join(' ');
       if (chunk.trim()) chunks.push(chunk);
       i += size - overlap;
-      if (i + overlap >= words.length) break;
+      // Task 1: fix dropping the last segment — was `if (i + overlap >= words.length) break;`
+      if (i >= words.length) break;
     }
   }
 
   return chunks.filter(c => c.trim().length > 20);
+}
+
+// Task 3: helper to strip markdown code fences before JSON.parse
+export function stripJsonFences(text: string): string {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  return fenced ? fenced[1].trim() : text.trim();
+}
+
+// Task 22: decision logic extracted for testability
+export type SaveDecision = 'skip' | 'new' | { supersede: number };
+export function decideSave(candidates: Array<{ id: number; distance: number }>): SaveDecision {
+  if (candidates.length === 0) return 'new';
+  const nearest = candidates[0];
+  if (nearest.distance < DUPLICATE_THRESHOLD) return 'skip';
+  if (nearest.distance < SUPERSESSION_THRESHOLD) return { supersede: nearest.id };
+  return 'new';
+}
+
+/** Open the DB, load sqlite-vec, and run schema migrations. */
+function openDb(path: string = DB_PATH, options?: Database.Options): Database.Database {
+  const db = new Database(path, options);
+  sqliteVec.load(db);
+  ensureSchema(db);
+  return db;
 }
 
 /**
@@ -162,8 +197,8 @@ export async function search(
   const out = await extractor(query, { pooling: 'mean', normalize: true });
   const embedding = serialize(Array.from(out.data as Float32Array));
 
-  const db = new Database(DB_PATH);
-  sqliteVec.load(db);
+  // Task 15: read phase — readonly DB
+  const db = openDb(DB_PATH, { readonly: true });
 
   // Fetch a wider candidate set and filter in JS — sqlite-vec applies KNN before WHERE filters,
   // so we ask for more than needed to avoid missing relevant tier-filtered results.
@@ -177,6 +212,8 @@ export async function search(
     ORDER BY e.distance
   `).all(embedding, topK * 4) as SearchResult[];
 
+  db.close();
+
   // Filter: long-term is always global; short-term must match project scope
   const rows = candidates
     .filter(r =>
@@ -186,16 +223,18 @@ export async function search(
     )
     .slice(0, topK);
 
-  // Track access for all returned rows
+  // Task 15: write phase — separate write DB only if there are results
   if (rows.length > 0) {
+    const writeDb = openDb(DB_PATH);
+    sqliteVec.load(writeDb);
     const now = Math.floor(Date.now() / 1000);
-    const update = db.prepare(
+    const update = writeDb.prepare(
       'UPDATE memories SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?'
     );
-    db.transaction(() => { for (const r of rows) update.run(now, r.id); })();
+    writeDb.transaction(() => { for (const r of rows) update.run(now, r.id); })();
+    writeDb.close();
   }
 
-  db.close();
   return rows;
 }
 
@@ -207,8 +246,7 @@ export async function searchAll(query: string, topK = 20): Promise<SearchResult[
   const out = await extractor(query, { pooling: 'mean', normalize: true });
   const embedding = serialize(Array.from(out.data as Float32Array));
 
-  const db = new Database(DB_PATH, { readonly: true });
-  sqliteVec.load(db);
+  const db = openDb(DB_PATH, { readonly: true });
 
   const rows = db.prepare(`
     SELECT m.id, m.path, m.title, m.topic, m.chunk, m.is_active, m.superseded_by,
@@ -250,32 +288,55 @@ export async function saveMemory(
   const out = await extractor(content, { pooling: 'mean', normalize: true });
   const embedding = serialize(Array.from(out.data as Float32Array));
 
-  const db = new Database(DB_PATH);
-  sqliteVec.load(db);
+  // Task 14: single DB connection with WAL mode
+  const db = openDb(DB_PATH);
+  db.pragma('journal_mode = WAL');
 
-  const candidates = db.prepare(`
-    SELECT m.id, m.path, m.title, e.distance
-    FROM memory_embeddings e
-    JOIN memories m ON m.id = e.id
-    WHERE e.embedding MATCH ? AND k = 5
-      AND m.is_active = 1
-    ORDER BY e.distance
-  `).all(embedding, 5) as Array<{ id: number; path: string; title: string; distance: number }>;
+  try {
+    let supersededId: number | null = null;
+    let shouldSkip = false;
 
-  db.close();
+    // Read + decide inside a transaction
+    db.transaction(() => {
+      const candidates = db.prepare(`
+        SELECT m.id, e.distance FROM memory_embeddings e
+        JOIN memories m ON m.id = e.id
+        WHERE e.embedding MATCH ? AND k = 5 AND m.is_active = 1
+        ORDER BY e.distance
+      `).all(embedding) as Array<{ id: number; distance: number }>;
 
-  if (candidates.length > 0) {
-    const nearest = candidates[0];
-    if (nearest.distance < DUPLICATE_THRESHOLD) return;
-    if (nearest.distance < SUPERSESSION_THRESHOLD) {
-      const filepath = _writeMarkdown(title, topic, content, mergedOpts);
-      _indexAndSupersede(title, topic, content, embedding, filepath, nearest.id, mergedOpts);
-      return;
-    }
+      const decision = decideSave(candidates);
+      if (decision === 'skip') { shouldSkip = true; return; }
+      if (decision !== 'new') { supersededId = (decision as { supersede: number }).supersede; }
+    })();
+
+    if (shouldSkip) return;
+
+    // File I/O outside transaction (unavoidable)
+    const filepath = _writeMarkdown(title, topic, content, mergedOpts);
+
+    // Write + supersede inside a transaction
+    db.transaction(() => {
+      const { lastInsertRowid } = db.prepare(`
+        INSERT INTO memories
+          (path, title, tags, topic, chunk, session_id, source_excerpt,
+           memory_tier, project_scope, confidence, decay_rate, supersedes, is_active, file_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 0.02, ?, 1, NULL)
+      `).run(
+        filepath, title, mergedOpts.tags ?? 'auto', topic, content,
+        mergedOpts.sessionId ?? null, mergedOpts.sourceExcerpt ?? null,
+        mergedOpts.tier, mergedOpts.projectScope, supersededId
+      );
+
+      db.prepare('INSERT INTO memory_embeddings (id, embedding) VALUES (?, ?)').run(lastInsertRowid, embedding);
+
+      if (supersededId !== null) {
+        db.prepare('UPDATE memories SET is_active = 0, superseded_by = ? WHERE id = ?').run(lastInsertRowid, supersededId);
+      }
+    })();
+  } finally {
+    db.close();
   }
-
-  const filepath = _writeMarkdown(title, topic, content, mergedOpts);
-  _indexNew(title, topic, content, embedding, filepath, mergedOpts);
 }
 
 function _writeMarkdown(
@@ -284,10 +345,13 @@ function _writeMarkdown(
   content: string,
   opts: SaveOptions & { tier: MemoryTier; projectScope: string | null }
 ): string {
-  const topicDir = join(RAW_DIR, topic);
+  // Task 6: sanitize topic for directory/path construction
+  const safeTopic = sanitizeTopic(topic);
+  const topicDir = join(RAW_DIR, safeTopic);
   mkdirSync(topicDir, { recursive: true });
   const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 50);
-  const filename = `${today()}-${slug}.md`;
+  // Task 2: add timestamp suffix to prevent filename collisions
+  const filename = `${today()}-${slug}-${Date.now().toString(36).slice(-6)}.md`;
   const filepath = join(topicDir, filename);
 
   writeFileSync(filepath, `---
@@ -299,68 +363,14 @@ tags: ${opts.tags ?? 'auto'}
 date: ${today()}
 source: auto
 session_id: ${opts.sessionId ?? ''}
+confidence: 1.0
+access_count: 0
 ---
 
 ${content}
 `, 'utf-8');
 
-  return `${topic}/${filename}`;
-}
-
-function _indexNew(
-  title: string,
-  topic: string,
-  content: string,
-  embedding: Buffer,
-  relPath: string,
-  opts: SaveOptions & { tier: MemoryTier; projectScope: string | null }
-): void {
-  if (!existsSync(DB_PATH)) return;
-  const db = new Database(DB_PATH);
-  sqliteVec.load(db);
-
-  const { lastInsertRowid } = db.prepare(`
-    INSERT INTO memories
-      (path, title, tags, topic, chunk, session_id, source_excerpt,
-       memory_tier, project_scope, confidence, decay_rate, is_active)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 0.02, 1)
-  `).run(
-    relPath, title, opts.tags ?? 'auto', topic, content,
-    opts.sessionId ?? null, opts.sourceExcerpt ?? null,
-    opts.tier, opts.projectScope
-  );
-
-  db.prepare('INSERT INTO memory_embeddings (id, embedding) VALUES (?, ?)').run(lastInsertRowid, embedding);
-  db.close();
-}
-
-function _indexAndSupersede(
-  title: string,
-  topic: string,
-  content: string,
-  embedding: Buffer,
-  relPath: string,
-  supersededId: number,
-  opts: SaveOptions & { tier: MemoryTier; projectScope: string | null }
-): void {
-  if (!existsSync(DB_PATH)) return;
-  const db = new Database(DB_PATH);
-  sqliteVec.load(db);
-
-  const { lastInsertRowid } = db.prepare(`
-    INSERT INTO memories
-      (path, title, tags, topic, chunk, session_id, source_excerpt,
-       memory_tier, project_scope, confidence, decay_rate, supersedes, is_active)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 0.02, ?, 1)
-  `).run(
-    relPath, title, opts.tags ?? 'auto', topic, content,
-    opts.sessionId ?? null, opts.sourceExcerpt ?? null,
-    opts.tier, opts.projectScope, supersededId
-  );
-
-  db.prepare('INSERT INTO memory_embeddings (id, embedding) VALUES (?, ?)').run(lastInsertRowid, embedding);
-  db.prepare('UPDATE memories SET is_active = 0, superseded_by = ? WHERE id = ?').run(lastInsertRowid, supersededId);
-  db.close();
+  return `${safeTopic}/${filename}`;
 }
 
 /**
@@ -375,6 +385,15 @@ export async function autoRemember(
 ): Promise<void> {
   if (!responseText || responseText.length < MIN_RESPONSE_LENGTH) return;
   if (!hasSignal(responseText)) return;
+
+  // Task 9: fail visibly if API key is missing
+  if (!process.env.ANTHROPIC_API_KEY) {
+    process.stderr.write('[Engram] ANTHROPIC_API_KEY not set — auto-remember disabled\n');
+    return;
+  }
+
+  // Task 26: allow disabling all Haiku API calls
+  if (process.env.ENGRAM_DISABLE_HAIKU === '1') return;
 
   const client = new Anthropic();
   const result = await client.messages.create({
@@ -401,7 +420,8 @@ or
   if (!text) return;
 
   let parsed: { worth_saving: boolean; title?: string; content?: string; excerpt?: string };
-  try { parsed = JSON.parse(text); } catch { return; }
+  // Task 3: strip markdown code fences before parsing
+  try { parsed = JSON.parse(stripJsonFences(text)); } catch { return; }
   if (!parsed.worth_saving || !parsed.title || !parsed.content) return;
 
   const scope = projectScope !== undefined ? projectScope : getProjectScope();
