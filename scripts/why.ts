@@ -8,7 +8,7 @@
  *   npx tsx scripts/why.ts "how did we handle auth"
  */
 
-import { searchAll, INJECTION_THRESHOLD } from '../lib/memory.ts';
+import { searchAll, INJECTION_THRESHOLD, getProjectScope } from '../lib/memory.ts';
 
 const RESET  = '\x1b[0m';
 const BOLD   = '\x1b[1m';
@@ -18,10 +18,17 @@ const YELLOW = '\x1b[33m';
 const RED    = '\x1b[31m';
 const CYAN   = '\x1b[36m';
 const GREY   = '\x1b[90m';
+const BLUE   = '\x1b[34m';
 
 function bar(distance: number, width = 30): string {
   const filled = Math.round((1 - distance) * width);
   return GREEN + '█'.repeat(filled) + GREY + '░'.repeat(width - filled) + RESET;
+}
+
+function tierBadge(tier: string): string {
+  return tier === 'long'
+    ? `${BLUE}[long]${RESET}`
+    : `${CYAN}[short]${RESET}`;
 }
 
 async function main() {
@@ -32,9 +39,12 @@ async function main() {
     process.exit(1);
   }
 
+  const currentScope = getProjectScope();
+
   console.log(`\n${BOLD}Engram retrieval trace${RESET}`);
   console.log(`${DIM}Query: "${query}"${RESET}`);
-  console.log(`${DIM}Threshold: ${INJECTION_THRESHOLD} (lower distance = more similar)${RESET}\n`);
+  console.log(`${DIM}Threshold: ${INJECTION_THRESHOLD} (lower distance = more similar)${RESET}`);
+  console.log(`${DIM}Project scope: ${currentScope ?? '(none)'}${RESET}\n`);
 
   console.log('Searching...');
   const results = await searchAll(query, 20);
@@ -48,28 +58,29 @@ async function main() {
   const filtered    = results.filter(r => r.distance >= INJECTION_THRESHOLD && r.is_active === 1);
   const superseded  = results.filter(r => r.is_active === 0);
 
-  // Would inject
   if (willInject.length > 0) {
     console.log(`${BOLD}${GREEN}✓ Would inject (${willInject.length})${RESET}\n`);
     for (const r of willInject) {
-      console.log(`  ${bar(r.distance)}  ${r.distance.toFixed(4)}  ${BOLD}${r.title}${RESET} ${GREY}(${r.topic})${RESET}`);
+      const scopeNote = r.memory_tier === 'short' && r.project_scope && r.project_scope !== currentScope
+        ? ` ${YELLOW}⚠ different project${RESET}`
+        : '';
+      console.log(`  ${bar(r.distance)}  ${r.distance.toFixed(4)}  ${tierBadge(r.memory_tier)}  ${BOLD}${r.title}${RESET} ${GREY}(${r.topic})${RESET}${scopeNote}`);
       console.log(`  ${GREY}${r.path}${RESET}`);
+      if (r.project_scope) console.log(`  ${DIM}scope: ${r.project_scope}${RESET}`);
       console.log(`  ${r.chunk.slice(0, 200).replace(/\n/g, ' ')}${r.chunk.length > 200 ? '...' : ''}\n`);
     }
   } else {
     console.log(`${YELLOW}✗ Nothing would be injected — no results below threshold ${INJECTION_THRESHOLD}${RESET}\n`);
   }
 
-  // Filtered out
   if (filtered.length > 0) {
-    console.log(`${BOLD}${YELLOW}◌ Filtered out — below threshold (${filtered.length})${RESET}\n`);
+    console.log(`${BOLD}${YELLOW}◌ Filtered out — above threshold (${filtered.length})${RESET}\n`);
     for (const r of filtered) {
-      console.log(`  ${bar(r.distance)}  ${r.distance.toFixed(4)}  ${DIM}${r.title} (${r.topic})${RESET}`);
+      console.log(`  ${bar(r.distance)}  ${r.distance.toFixed(4)}  ${tierBadge(r.memory_tier)}  ${DIM}${r.title} (${r.topic})${RESET}`);
     }
     console.log();
   }
 
-  // Superseded
   if (superseded.length > 0) {
     console.log(`${BOLD}${RED}⊘ Superseded — skipped (${superseded.length})${RESET}\n`);
     for (const r of superseded) {
@@ -78,7 +89,10 @@ async function main() {
     console.log();
   }
 
-  console.log(`${CYAN}Summary: ${willInject.length} inject / ${filtered.length} filtered / ${superseded.length} superseded out of ${results.length} candidates${RESET}\n`);
+  const longCount  = results.filter(r => r.memory_tier === 'long').length;
+  const shortCount = results.filter(r => r.memory_tier === 'short').length;
+  console.log(`${CYAN}Summary: ${willInject.length} inject / ${filtered.length} filtered / ${superseded.length} superseded out of ${results.length} candidates${RESET}`);
+  console.log(`${DIM}Tiers: ${longCount} long-term, ${shortCount} short-term${RESET}\n`);
 }
 
 main().catch(console.error);

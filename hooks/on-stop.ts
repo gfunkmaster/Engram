@@ -7,7 +7,7 @@
  */
 
 import { readFileSync, existsSync } from 'fs';
-import { autoRemember, getTopicFromGit } from '../lib/memory.ts';
+import { autoRemember, getTopicFromGit, getProjectScope } from '../lib/memory.ts';
 
 function getLastAssistantMessage(transcriptPath: string): string {
   try {
@@ -46,8 +46,9 @@ async function main(): Promise<void> {
 
   const lastResponse = getLastAssistantMessage(transcriptPath);
   const topic = getTopicFromGit();
+  const projectScope = getProjectScope();
 
-  await autoRemember(lastResponse, topic, sessionId);
+  await autoRemember(lastResponse, topic, sessionId, projectScope);
 }
 
 main().catch(() => {});

@@ -15,6 +15,7 @@ import { readFileSync, readdirSync, statSync } from 'fs';
 import { join, relative, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { chunkText, serialize } from '../lib/memory.ts';
+import type { MemoryTier } from '../lib/memory.ts';
 
 const ENGRAM_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
 const MEMORY_DIR = join(ENGRAM_DIR, 'memory', 'raw');
@@ -28,6 +29,8 @@ interface MemoryRow {
   topic: string;
   chunk: string;
   session_id: string | null;
+  memory_tier: MemoryTier;
+  project_scope: string | null;
 }
 
 function extractFrontmatter(content: string): { meta: Record<string, string>; body: string } {
@@ -89,7 +92,13 @@ async function main() {
       created_at      INTEGER DEFAULT (unixepoch()),
       supersedes      INTEGER,
       superseded_by   INTEGER,
-      is_active       INTEGER DEFAULT 1
+      is_active       INTEGER DEFAULT 1,
+      memory_tier     TEXT DEFAULT 'short',
+      project_scope   TEXT,
+      confidence      REAL DEFAULT 1.0,
+      decay_rate      REAL DEFAULT 0.02,
+      access_count    INTEGER DEFAULT 0,
+      last_accessed_at INTEGER
     );
 
     CREATE VIRTUAL TABLE memory_embeddings USING vec0(
@@ -99,8 +108,9 @@ async function main() {
   `);
 
   const insertMemory = db.prepare(`
-    INSERT INTO memories (path, title, tags, topic, chunk, session_id, is_active)
-    VALUES (?, ?, ?, ?, ?, ?, 1)
+    INSERT INTO memories
+      (path, title, tags, topic, chunk, session_id, is_active, memory_tier, project_scope)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
   `);
   const insertEmbedding = db.prepare(
     'INSERT INTO memory_embeddings (id, embedding) VALUES (?, ?)'
@@ -113,7 +123,8 @@ async function main() {
     for (let i = 0; i < rows.length; i++) {
       const r = rows[i];
       const { lastInsertRowid } = insertMemory.run(
-        r.path, r.title, r.tags, r.topic, r.chunk, r.session_id
+        r.path, r.title, r.tags, r.topic, r.chunk, r.session_id,
+        r.memory_tier, r.project_scope
       );
       insertEmbedding.run(lastInsertRowid, embeddings[i]);
     }
@@ -127,6 +138,8 @@ async function main() {
     const title = meta['title'] ?? file.split('/').at(-1)?.replace('.md', '') ?? '';
     const tags = meta['tags'] ?? '';
     const sessionId = meta['session_id'] ?? null;
+    const tier = (meta['tier'] === 'long' ? 'long' : 'short') as MemoryTier;
+    const projectScope = meta['project_scope'] ? meta['project_scope'] : null;
 
     const chunks = chunkText(body).filter(c => c.trim());
     const rows: MemoryRow[] = [];
@@ -134,12 +147,13 @@ async function main() {
 
     for (const c of chunks) {
       const output = await extractor(c, { pooling: 'mean', normalize: true });
-      rows.push({ path: relPath, title, tags, topic, chunk: c, session_id: sessionId });
+      rows.push({ path: relPath, title, tags, topic, chunk: c, session_id: sessionId, memory_tier: tier, project_scope: projectScope });
       embeddings.push(serialize(Array.from(output.data as Float32Array)));
     }
 
     insertBatch(rows, embeddings);
-    console.log(`  ✓ ${relPath} (${chunks.length} chunk${chunks.length !== 1 ? 's' : ''})`);
+    const tierLabel = tier === 'long' ? '[long]' : '[short]';
+    console.log(`  ✓ ${relPath} ${tierLabel} (${chunks.length} chunk${chunks.length !== 1 ? 's' : ''})`);
   }
 
   db.close();

@@ -20,12 +20,12 @@ const EMBED_MODEL = 'Xenova/all-MiniLM-L6-v2';
 const HAIKU = 'claude-haiku-4-5-20251001';
 
 // Distance thresholds (cosine distance — lower = more similar)
-const DUPLICATE_THRESHOLD = 0.15;    // skip: near-identical already exists
-const SUPERSESSION_THRESHOLD = 0.35; // supersede: clearly an update to existing
-export const INJECTION_THRESHOLD = 0.75; // inject: high confidence relevance only
+const DUPLICATE_THRESHOLD = 0.15;
+const SUPERSESSION_THRESHOLD = 0.35;
+export const INJECTION_THRESHOLD = 0.75;
 
-// Skip Haiku entirely for short responses — nothing meaningful to extract
 const MIN_RESPONSE_LENGTH = 200;
+export const PROMOTE_ACCESS_THRESHOLD = 3; // short→long after this many distinct accesses
 
 export const SIGNAL_PHRASES = [
   // Discovery
@@ -49,6 +49,8 @@ export const SIGNAL_PHRASES = [
   'what this means', 'worth remembering',
 ];
 
+export type MemoryTier = 'short' | 'long';
+
 export interface SearchResult {
   id: number;
   path: string;
@@ -58,12 +60,18 @@ export interface SearchResult {
   distance: number;
   is_active: number;
   superseded_by: number | null;
+  memory_tier: MemoryTier;
+  project_scope: string | null;
+  confidence: number;
+  access_count: number;
 }
 
 export interface SaveOptions {
   sessionId?: string;
   sourceExcerpt?: string;
   tags?: string;
+  tier?: MemoryTier;
+  projectScope?: string | null;
 }
 
 export function serialize(vector: number[]): Buffer {
@@ -96,12 +104,23 @@ export function getTopicFromGit(): string {
   }
 }
 
+/** Returns the git remote origin URL for the current working directory, or null. */
+export function getProjectScope(): string | null {
+  try {
+    const remote = execSync('git remote get-url origin', {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return remote || null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Sliding window chunker with heading-aware splitting.
- * Splits on markdown headings first, then applies overlapping window.
  */
 export function chunkText(text: string, size = 400, overlap = 80): string[] {
-  // Split on markdown headings to preserve semantic boundaries
   const sections = text.split(/(?=^#{1,3}\s)/m).filter(s => s.trim().length > 20);
   const chunks: string[] = [];
 
@@ -123,25 +142,58 @@ export function chunkText(text: string, size = 400, overlap = 80): string[] {
   return chunks.filter(c => c.trim().length > 20);
 }
 
-/** Semantic search over active memories only. */
-export async function search(query: string, topK = 5): Promise<SearchResult[]> {
+/**
+ * Tier-aware semantic search.
+ *
+ * Returns long-term memories (global) + short-term memories scoped to the
+ * current project. Unscoped short-term memories (project_scope IS NULL) are
+ * included regardless. Access count is incremented for every returned result.
+ */
+export async function search(
+  query: string,
+  topK = 5,
+  projectScope?: string | null
+): Promise<SearchResult[]> {
   if (!existsSync(DB_PATH)) return [];
+
+  const scope = projectScope !== undefined ? projectScope : getProjectScope();
 
   const extractor = await pipeline('feature-extraction', EMBED_MODEL, { dtype: 'fp32' });
   const out = await extractor(query, { pooling: 'mean', normalize: true });
   const embedding = serialize(Array.from(out.data as Float32Array));
 
-  const db = new Database(DB_PATH, { readonly: true });
+  const db = new Database(DB_PATH);
   sqliteVec.load(db);
 
-  const rows = db.prepare(`
-    SELECT m.id, m.path, m.title, m.topic, m.chunk, m.is_active, m.superseded_by, e.distance
+  // Fetch a wider candidate set and filter in JS — sqlite-vec applies KNN before WHERE filters,
+  // so we ask for more than needed to avoid missing relevant tier-filtered results.
+  const candidates = db.prepare(`
+    SELECT m.id, m.path, m.title, m.topic, m.chunk, m.is_active, m.superseded_by,
+           m.memory_tier, m.project_scope, m.confidence, m.access_count, e.distance
     FROM memory_embeddings e
     JOIN memories m ON m.id = e.id
     WHERE e.embedding MATCH ? AND k = ?
       AND m.is_active = 1
     ORDER BY e.distance
-  `).all(embedding, topK) as SearchResult[];
+  `).all(embedding, topK * 4) as SearchResult[];
+
+  // Filter: long-term is always global; short-term must match project scope
+  const rows = candidates
+    .filter(r =>
+      r.memory_tier === 'long' ||
+      r.project_scope === null ||
+      (scope !== null && r.project_scope === scope)
+    )
+    .slice(0, topK);
+
+  // Track access for all returned rows
+  if (rows.length > 0) {
+    const now = Math.floor(Date.now() / 1000);
+    const update = db.prepare(
+      'UPDATE memories SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?'
+    );
+    db.transaction(() => { for (const r of rows) update.run(now, r.id); })();
+  }
 
   db.close();
   return rows;
@@ -159,7 +211,8 @@ export async function searchAll(query: string, topK = 20): Promise<SearchResult[
   sqliteVec.load(db);
 
   const rows = db.prepare(`
-    SELECT m.id, m.path, m.title, m.topic, m.chunk, m.is_active, m.superseded_by, e.distance
+    SELECT m.id, m.path, m.title, m.topic, m.chunk, m.is_active, m.superseded_by,
+           m.memory_tier, m.project_scope, m.confidence, m.access_count, e.distance
     FROM memory_embeddings e
     JOIN memories m ON m.id = e.id
     WHERE e.embedding MATCH ? AND k = ?
@@ -177,9 +230,19 @@ export async function saveMemory(
   content: string,
   opts: SaveOptions = {}
 ): Promise<void> {
+  const tier: MemoryTier = opts.tier ?? 'short';
+  const projectScope = opts.projectScope !== undefined
+    ? opts.projectScope
+    : (tier === 'short' ? getProjectScope() : null);
+
+  const mergedOpts: SaveOptions & { tier: MemoryTier; projectScope: string | null } = {
+    ...opts,
+    tier,
+    projectScope,
+  };
+
   if (!existsSync(DB_PATH)) {
-    // No DB yet — write file only, will be indexed on next reindex
-    _writeMarkdown(title, topic, content, opts);
+    _writeMarkdown(title, topic, content, mergedOpts);
     return;
   }
 
@@ -190,7 +253,6 @@ export async function saveMemory(
   const db = new Database(DB_PATH);
   sqliteVec.load(db);
 
-  // Find nearest existing memories
   const candidates = db.prepare(`
     SELECT m.id, m.path, m.title, e.distance
     FROM memory_embeddings e
@@ -204,28 +266,23 @@ export async function saveMemory(
 
   if (candidates.length > 0) {
     const nearest = candidates[0];
-
-    // Exact duplicate — skip silently
     if (nearest.distance < DUPLICATE_THRESHOLD) return;
-
-    // Near-duplicate — supersede old memory
     if (nearest.distance < SUPERSESSION_THRESHOLD) {
-      const filepath = _writeMarkdown(title, topic, content, opts);
-      _indexAndSupersede(title, topic, content, embedding, filepath, nearest.id, opts);
+      const filepath = _writeMarkdown(title, topic, content, mergedOpts);
+      _indexAndSupersede(title, topic, content, embedding, filepath, nearest.id, mergedOpts);
       return;
     }
   }
 
-  // New memory — write and index normally
-  const filepath = _writeMarkdown(title, topic, content, opts);
-  _indexNew(title, topic, content, embedding, filepath, opts);
+  const filepath = _writeMarkdown(title, topic, content, mergedOpts);
+  _indexNew(title, topic, content, embedding, filepath, mergedOpts);
 }
 
 function _writeMarkdown(
   title: string,
   topic: string,
   content: string,
-  opts: SaveOptions
+  opts: SaveOptions & { tier: MemoryTier; projectScope: string | null }
 ): string {
   const topicDir = join(RAW_DIR, topic);
   mkdirSync(topicDir, { recursive: true });
@@ -236,6 +293,8 @@ function _writeMarkdown(
   writeFileSync(filepath, `---
 title: ${title}
 topic: ${topic}
+tier: ${opts.tier}
+project_scope: ${opts.projectScope ?? ''}
 tags: ${opts.tags ?? 'auto'}
 date: ${today()}
 source: auto
@@ -254,7 +313,7 @@ function _indexNew(
   content: string,
   embedding: Buffer,
   relPath: string,
-  opts: SaveOptions
+  opts: SaveOptions & { tier: MemoryTier; projectScope: string | null }
 ): void {
   if (!existsSync(DB_PATH)) return;
   const db = new Database(DB_PATH);
@@ -262,15 +321,16 @@ function _indexNew(
 
   const { lastInsertRowid } = db.prepare(`
     INSERT INTO memories
-      (path, title, tags, topic, chunk, session_id, source_excerpt, is_active)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-  `).run(relPath, title, opts.tags ?? 'auto', topic, content,
-         opts.sessionId ?? null, opts.sourceExcerpt ?? null);
+      (path, title, tags, topic, chunk, session_id, source_excerpt,
+       memory_tier, project_scope, confidence, decay_rate, is_active)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 0.02, 1)
+  `).run(
+    relPath, title, opts.tags ?? 'auto', topic, content,
+    opts.sessionId ?? null, opts.sourceExcerpt ?? null,
+    opts.tier, opts.projectScope
+  );
 
-  db.prepare(
-    'INSERT INTO memory_embeddings (id, embedding) VALUES (?, ?)'
-  ).run(lastInsertRowid, embedding);
-
+  db.prepare('INSERT INTO memory_embeddings (id, embedding) VALUES (?, ?)').run(lastInsertRowid, embedding);
   db.close();
 }
 
@@ -281,7 +341,7 @@ function _indexAndSupersede(
   embedding: Buffer,
   relPath: string,
   supersededId: number,
-  opts: SaveOptions
+  opts: SaveOptions & { tier: MemoryTier; projectScope: string | null }
 ): void {
   if (!existsSync(DB_PATH)) return;
   const db = new Database(DB_PATH);
@@ -289,31 +349,29 @@ function _indexAndSupersede(
 
   const { lastInsertRowid } = db.prepare(`
     INSERT INTO memories
-      (path, title, tags, topic, chunk, session_id, source_excerpt, supersedes, is_active)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
-  `).run(relPath, title, opts.tags ?? 'auto', topic, content,
-         opts.sessionId ?? null, opts.sourceExcerpt ?? null, supersededId);
+      (path, title, tags, topic, chunk, session_id, source_excerpt,
+       memory_tier, project_scope, confidence, decay_rate, supersedes, is_active)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 0.02, ?, 1)
+  `).run(
+    relPath, title, opts.tags ?? 'auto', topic, content,
+    opts.sessionId ?? null, opts.sourceExcerpt ?? null,
+    opts.tier, opts.projectScope, supersededId
+  );
 
-  db.prepare(
-    'INSERT INTO memory_embeddings (id, embedding) VALUES (?, ?)'
-  ).run(lastInsertRowid, embedding);
-
-  // Mark old memory as superseded
-  db.prepare(
-    'UPDATE memories SET is_active = 0, superseded_by = ? WHERE id = ?'
-  ).run(lastInsertRowid, supersededId);
-
+  db.prepare('INSERT INTO memory_embeddings (id, embedding) VALUES (?, ?)').run(lastInsertRowid, embedding);
+  db.prepare('UPDATE memories SET is_active = 0, superseded_by = ? WHERE id = ?').run(lastInsertRowid, supersededId);
   db.close();
 }
 
 /**
  * Use Haiku to decide if a response contains a learning worth saving.
- * Fires in background — never throws, never blocks.
+ * Saves as short-term memory scoped to the current project.
  */
 export async function autoRemember(
   responseText: string,
   topic?: string,
-  sessionId?: string
+  sessionId?: string,
+  projectScope?: string | null
 ): Promise<void> {
   if (!responseText || responseText.length < MIN_RESPONSE_LENGTH) return;
   if (!hasSignal(responseText)) return;
@@ -346,8 +404,12 @@ or
   try { parsed = JSON.parse(text); } catch { return; }
   if (!parsed.worth_saving || !parsed.title || !parsed.content) return;
 
+  const scope = projectScope !== undefined ? projectScope : getProjectScope();
+
   await saveMemory(parsed.title, topic ?? getTopicFromGit(), parsed.content, {
     sessionId,
     sourceExcerpt: parsed.excerpt,
+    tier: 'short',
+    projectScope: scope,
   });
 }

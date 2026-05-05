@@ -7,7 +7,9 @@
     "reindex": "tsx scripts/reindex.ts",
     "search": "tsx scripts/search.ts",
     "remember": "tsx scripts/remember.ts",
-    "why": "tsx scripts/why.ts"
+    "why": "tsx scripts/why.ts",
+    "promote": "tsx scripts/promote.ts",
+    "decay": "tsx scripts/decay.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.51.0",
