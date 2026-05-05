@@ -288,6 +288,21 @@ WantedBy=default.target
 
 Enable: `systemctl --user enable --now engram-daemon`
 
+### Windows Task Scheduler (auto-start on login)
+
+Run this once in an elevated PowerShell prompt:
+
+```powershell
+$action  = New-ScheduledTaskAction `
+  -Execute "node" `
+  -Argument "node_modules\.bin\tsx daemon\server.ts" `
+  -WorkingDirectory "$HOME\.engram"
+$trigger = New-ScheduledTaskTrigger -AtLogOn
+Register-ScheduledTask -TaskName "EngramDaemon" -Action $action -Trigger $trigger -RunLevel Highest
+```
+
+Or manually via the GUI: Task Scheduler → Create Basic Task → Trigger: At log on → Action: Start a program → Program: `node` → Arguments: `node_modules\.bin\tsx daemon\server.ts` → Start in: `C:\Users\<user>\.engram`
+
 ---
 
 ## Security & Privacy
@@ -296,6 +311,21 @@ Enable: `systemctl --user enable --now engram-daemon`
 - **Disable all API calls**: Set `ENGRAM_DISABLE_HAIKU=1` to disable auto-remember entirely. Engram will only save memories you explicitly write with `npm run remember`. No data leaves your machine.
 - **Embeddings are local**: The embedding model (all-MiniLM-L6-v2) runs locally via ONNX. No data leaves your machine for search.
 - **Storage is local**: The DB (`memory/memory.db`) and markdown files (`memory/raw/`) are local only. They are never uploaded anywhere by Engram.
+
+---
+
+## Environment Variables
+
+All tuneable behaviour can be overridden without editing source.
+
+| Variable | Default | Description |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | *(required)* | API key for Haiku auto-remember calls. Set by Claude Code automatically. |
+| `ENGRAM_MODEL` | `claude-haiku-4-5-20251001` | Override the model used for auto-remember judgment. Any Anthropic model ID accepted. |
+| `ENGRAM_DISABLE_HAIKU` | `0` | Set to `1` to disable all Haiku API calls. Auto-remember is silenced; manual `npm run remember` still works. |
+| `ENGRAM_PROMOTE_THRESHOLD` | `10` | Number of accesses before a short-term memory is eligible for promotion to long-term. Lower = more aggressive promotion. |
+| `ENGRAM_DECAY_RATE` | *(per-memory, default `0.02`)* | Global decay rate override applied to all short-term memories during `npm run decay`. Calibrated for daily runs. Use `0.005` for weekly. |
+| `ENGRAM_PORT` | `7700` | Port the daemon listens on. Must match between server and client. |
 
 ---
 

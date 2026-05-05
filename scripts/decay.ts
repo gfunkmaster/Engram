@@ -58,9 +58,10 @@ async function main() {
   const apply = args.includes('--apply');
   const cutoffIdx = args.indexOf('--cutoff');
   const cutoff = cutoffIdx !== -1 ? parseFloat(args[cutoffIdx + 1]) : DEACTIVATE_CUTOFF;
-  // Task 25: --rate flag to override per-memory decay_rate globally
+  // --rate flag or ENGRAM_DECAY_RATE env var overrides per-memory decay_rate globally
   const rateIdx = args.indexOf('--rate');
-  const globalRate = rateIdx !== -1 ? parseFloat(args[rateIdx + 1]) : null;
+  const envRate = process.env.ENGRAM_DECAY_RATE ? parseFloat(process.env.ENGRAM_DECAY_RATE) : null;
+  const globalRate = rateIdx !== -1 ? parseFloat(args[rateIdx + 1]) : envRate;
 
   if (!apply) {
     console.log(`\n${YELLOW}Dry-run mode — pass --apply to commit changes${RESET}\n`);

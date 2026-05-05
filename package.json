@@ -12,6 +12,7 @@
     "decay": "tsx scripts/decay.ts",
     "migrate": "tsx scripts/migrate.ts",
     "purge": "tsx scripts/purge.ts",
+    "reject": "tsx scripts/reject.ts",
     "status": "tsx scripts/status.ts",
     "daemon": "tsx daemon/server.ts",
     "test": "vitest run tests/"

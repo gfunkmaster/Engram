@@ -8,7 +8,7 @@ import * as sqliteVec from 'sqlite-vec';
 import { pipeline } from '@huggingface/transformers';
 import Anthropic from '@anthropic-ai/sdk';
 import { writeFileSync, mkdirSync, existsSync } from 'fs';
-import { join, dirname } from 'path';
+import { join, dirname, basename } from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 import { ensureSchema } from './migrate.ts';
@@ -27,7 +27,7 @@ export const SUPERSESSION_THRESHOLD = 0.35;
 export const INJECTION_THRESHOLD = 0.75;
 
 const MIN_RESPONSE_LENGTH = 200;
-export const PROMOTE_ACCESS_THRESHOLD = 3; // short→long after this many distinct accesses
+export const PROMOTE_ACCESS_THRESHOLD = parseInt(process.env.ENGRAM_PROMOTE_THRESHOLD ?? '10', 10);
 
 export const SIGNAL_PHRASES = [
   // Discovery
@@ -104,11 +104,18 @@ export function getTopicFromGit(): string {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
-    if (!branch || branch === 'main' || branch === 'master') return 'general';
-    const parts = branch.split('/');
-    const slug = parts.length > 1 ? parts[1] : branch;
-    // Task 6: sanitize the topic slug
-    return sanitizeTopic(slug.split('-')[0]);
+
+    if (!branch || branch === 'main' || branch === 'master') {
+      // On main/master, use the repo name as the topic
+      const repoPath = execSync('git rev-parse --show-toplevel', {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      return sanitizeTopic(basename(repoPath));
+    }
+
+    // Use the full branch name sanitized — ESHM-1234-fix-jwt → eshm-1234-fix-jwt
+    return sanitizeTopic(branch);
   } catch {
     return 'general';
   }
@@ -197,45 +204,65 @@ export async function search(
   const out = await extractor(query, { pooling: 'mean', normalize: true });
   const embedding = serialize(Array.from(out.data as Float32Array));
 
-  // Task 15: read phase — readonly DB
+  // Two separate queries guarantee best results from each tier regardless of mix.
+  // sqlite-vec applies KNN before WHERE filters, so a single combined query can miss
+  // relevant short-term results when long-term memories dominate the top-K candidates.
+  const kPerTier = Math.max(topK * 2, 20);
   const db = openDb(DB_PATH, { readonly: true });
 
-  // Fetch a wider candidate set and filter in JS — sqlite-vec applies KNN before WHERE filters,
-  // so we ask for more than needed to avoid missing relevant tier-filtered results.
-  const candidates = db.prepare(`
+  const SELECT = `
     SELECT m.id, m.path, m.title, m.topic, m.chunk, m.is_active, m.superseded_by,
            m.memory_tier, m.project_scope, m.confidence, m.access_count, e.distance
     FROM memory_embeddings e
     JOIN memories m ON m.id = e.id
+  `;
+
+  // Query 1: long-term (global, no scope filter)
+  const longTerm = db.prepare(`
+    ${SELECT}
     WHERE e.embedding MATCH ? AND k = ?
-      AND m.is_active = 1
+      AND m.is_active = 1 AND m.memory_tier = 'long'
     ORDER BY e.distance
-  `).all(embedding, topK * 4) as SearchResult[];
+  `).all(embedding, kPerTier) as SearchResult[];
+
+  // Query 2: short-term scoped to current project (or unscoped)
+  const shortTerm = scope !== null
+    ? db.prepare(`
+        ${SELECT}
+        WHERE e.embedding MATCH ? AND k = ?
+          AND m.is_active = 1 AND m.memory_tier = 'short'
+          AND (m.project_scope = ? OR m.project_scope IS NULL)
+        ORDER BY e.distance
+      `).all(embedding, kPerTier, scope) as SearchResult[]
+    : db.prepare(`
+        ${SELECT}
+        WHERE e.embedding MATCH ? AND k = ?
+          AND m.is_active = 1 AND m.memory_tier = 'short'
+        ORDER BY e.distance
+      `).all(embedding, kPerTier) as SearchResult[];
 
   db.close();
 
-  // Filter: long-term is always global; short-term must match project scope
-  const rows = candidates
-    .filter(r =>
-      r.memory_tier === 'long' ||
-      r.project_scope === null ||
-      (scope !== null && r.project_scope === scope)
-    )
-    .slice(0, topK);
+  // Merge, deduplicate by id, sort by distance
+  const seen = new Set<number>();
+  const rows: SearchResult[] = [];
+  for (const r of [...longTerm, ...shortTerm].sort((a, b) => a.distance - b.distance)) {
+    if (!seen.has(r.id)) { seen.add(r.id); rows.push(r); }
+  }
+  const result = rows.slice(0, topK);
 
-  // Task 15: write phase — separate write DB only if there are results
-  if (rows.length > 0) {
+  // Write phase — separate write DB only when there are results to track
+  if (result.length > 0) {
     const writeDb = openDb(DB_PATH);
-    sqliteVec.load(writeDb);
     const now = Math.floor(Date.now() / 1000);
     const update = writeDb.prepare(
       'UPDATE memories SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?'
     );
-    writeDb.transaction(() => { for (const r of rows) update.run(now, r.id); })();
+    writeDb.transaction(() => { for (const r of result) update.run(now, r.id); })();
     writeDb.close();
   }
 
-  return rows;
+  return result;
 }
 
 /** Search including superseded memories — used by the why CLI. */
