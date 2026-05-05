@@ -14,6 +14,8 @@ import Anthropic from '@anthropic-ai/sdk';
 import { search, autoRemember, getProjectScope, INJECTION_THRESHOLD } from './memory.ts';
 import type { SearchResult } from './memory.ts';
 
+// Use the non-streaming overload only — streaming responses are passed through unchanged.
+type MessageCreateParamsNonStreaming = Parameters<Anthropic['messages']['create']>[0] & { stream?: false };
 type MessageCreateParams = Parameters<Anthropic['messages']['create']>[0];
 type MessageResponse = Awaited<ReturnType<Anthropic['messages']['create']>>;
 
@@ -54,10 +56,15 @@ export class EngramClient {
 
   messages = {
     create: async (params: MessageCreateParams): Promise<MessageResponse> => {
+      // Streaming responses can't be buffered for memory extraction — pass through unchanged.
+      if (params.stream === true) {
+        return this.client.messages.create(params) as Promise<MessageResponse>;
+      }
+
       const query = extractUserQuery(params);
 
       // 1. Search memory and inject as system context
-      let enrichedParams = { ...params };
+      let enrichedParams = { ...params } as MessageCreateParams;
       if (query.length > 20) {
         try {
           const memories = await search(query, 3);

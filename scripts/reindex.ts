@@ -144,9 +144,17 @@ async function main() {
     }
   });
 
-  const deleteByPath = db.prepare('DELETE FROM memory_embeddings WHERE id IN (SELECT id FROM memories WHERE path = ?)');
+  const deleteEmbeddingsByIds = db.prepare('DELETE FROM memory_embeddings WHERE id IN (SELECT id FROM memories WHERE path = ?)');
   const deleteMemoryByPath = db.prepare('DELETE FROM memories WHERE path = ?');
   const getExistingHash = db.prepare('SELECT file_hash FROM memories WHERE path = ? LIMIT 1');
+  // Reactivate memories in OTHER files that were superseded by a row we're about to delete.
+  // This prevents dangling superseded_by references after a file edit.
+  const reactivateOrphans = db.prepare(`
+    UPDATE memories
+    SET is_active = 1, superseded_by = NULL
+    WHERE superseded_by IN (SELECT id FROM memories WHERE path = ?)
+      AND path != ?
+  `);
 
   let skipped = 0;
   let updated = 0;
@@ -167,8 +175,10 @@ async function main() {
         skipped++;
         continue;
       }
-      // File changed — delete old rows, then reinsert
-      deleteByPath.run(relPath);
+      // File changed — reactivate any memories superseded by our old rows (prevent dangling refs),
+      // then delete old rows and reinsert.
+      reactivateOrphans.run(relPath, relPath);
+      deleteEmbeddingsByIds.run(relPath);
       deleteMemoryByPath.run(relPath);
       updated++;
     } else {
