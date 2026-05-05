@@ -33,6 +33,29 @@ Fully automatic in both directions. You just work.
 
 ---
 
+## Tiered Memory
+
+Engram keeps two classes of memory:
+
+| Tier | Scope | Lifespan | When used |
+|---|---|---|---|
+| **Short-term** | Per-project (git remote) | Decays over time | Project-specific patterns, in-flight context, local gotchas |
+| **Long-term** | Global (cross-project) | Permanent | Principles, architectural patterns, hard-won lessons |
+
+Every new auto-saved memory starts as **short-term**, tagged to the project it came from. When a memory is accessed repeatedly (default: 3 times), it is promoted to **long-term** and becomes globally available across all projects.
+
+Short-term memories decay in confidence over time. Ones that are never accessed again fade out automatically — keeping memory lean and relevant.
+
+```
+Session ends
+  → memory saved as short-term, scoped to this project's git remote
+  → accessed again in a later session → access_count increments
+  → access_count reaches threshold → npm run promote --apply
+  → memory becomes long-term, project scope cleared
+```
+
+---
+
 ## Setup
 
 ```bash
@@ -40,7 +63,7 @@ git clone https://github.com/gfunkmaster/Engram ~/.engram
 cd ~/.engram && npm install
 ```
 
-On a new machine, after cloning:
+On a new machine after cloning:
 
 ```bash
 npm run reindex   # rebuilds the vector index from your markdown files
@@ -68,6 +91,32 @@ npm run search -- "how did we handle JWT auth"
 npm run search -- "websocket reconnection strategy" --top 3
 ```
 
+### Debug retrieval — see exactly what would be injected and why
+
+```bash
+npm run why -- "JWT refresh flow"
+```
+
+Output shows distance scores, tier badges, project scope, and whether each memory would be injected, filtered, or was superseded.
+
+### Promote short-term memories to long-term
+
+```bash
+npm run promote            # dry-run: shows what's eligible (default threshold: 3 accesses)
+npm run promote -- --apply # commit the promotions
+npm run promote -- --min 5 # custom access threshold
+```
+
+### Apply confidence decay to short-term memories
+
+```bash
+npm run decay              # dry-run: shows confidence bars and what would be deactivated
+npm run decay -- --apply   # commit the decay
+npm run decay -- --cutoff 0.05  # custom deactivation cutoff
+```
+
+Run `decay` on a schedule (weekly is typical) to let stale project-specific memories fade out.
+
 ### Rebuild the full index
 
 ```bash
@@ -83,6 +132,9 @@ npm run reindex
 | `reindex.ts` | `npm run reindex` | Rebuild vector index from all markdown files |
 | `search.ts` | `npm run search -- "<query>"` | Semantic search over memory |
 | `remember.ts` | `npm run remember -- --topic ... --title ...` | Write and immediately index a new memory |
+| `why.ts` | `npm run why -- "<query>"` | Debug retrieval pipeline — shows distances, tiers, and filter reasons |
+| `promote.ts` | `npm run promote` | Promote eligible short-term memories to long-term |
+| `decay.ts` | `npm run decay` | Apply confidence decay to short-term memories |
 
 ---
 
@@ -92,13 +144,21 @@ npm run reindex
 ~/.engram/
 ├── package.json
 ├── tsconfig.json
+├── lib/
+│   └── memory.ts         ← shared primitives (search, save, embed, chunk)
 ├── scripts/
 │   ├── reindex.ts
 │   ├── search.ts
-│   └── remember.ts
+│   ├── remember.ts
+│   ├── why.ts
+│   ├── promote.ts
+│   └── decay.ts
+├── hooks/
+│   ├── on-prompt.ts      ← UserPromptSubmit: auto-search + inject
+│   └── on-stop.ts        ← Stop: auto-remember + save
 └── memory/
-    ├── raw/          ← markdown files (git-tracked, source of truth)
-    └── memory.db     ← vector index (gitignored, regeneratable)
+    ├── raw/              ← markdown files (git-tracked, source of truth)
+    └── memory.db         ← vector index (gitignored, regeneratable)
 ```
 
 Memory is organized by topic:
@@ -109,6 +169,24 @@ memory/raw/
 ├── patterns/
 ├── decisions/
 └── learnings/
+```
+
+Each file carries frontmatter that records tier, project scope, session provenance, and confidence:
+
+```markdown
+---
+title: JWT refresh token rotation
+topic: auth
+tier: short
+project_scope: https://github.com/org/api-service
+tags: auth,jwt
+date: 2026-05-05
+session_id: abc123
+---
+
+Always rotate the refresh token on every use. Reusing the same token is a
+vector for token theft — if the original is stolen, the legitimate user's
+next refresh will fail and alert you.
 ```
 
 ---
@@ -149,23 +227,37 @@ Two hooks make Engram fully automatic. Add both to `~/.claude/settings.json`:
 ### `hooks/on-prompt.ts` — auto-search (on every prompt)
 
 1. Embeds your prompt locally
-2. Searches memory for relevant past learnings
+2. Searches memory — long-term globally, short-term filtered to the current project
 3. Injects matches as silent context before Claude sees your message
 4. Exits in milliseconds if nothing relevant found
 
 ### `hooks/on-stop.ts` — auto-remember (after every response)
 
 1. Reads Claude's last response from the session transcript
-2. Runs a fast signal-phrase check (`"turns out"`, `"root cause"`, `"the gotcha"`, etc.)
+2. Runs a fast signal-phrase check (`"turns out"`, `"root cause"`, `"gotcha"`, etc.)
 3. If no signals → exits immediately, zero cost
 4. If signals found → sends response to Claude Haiku: *"is this worth saving?"*
-5. If yes → checks for duplicates → embeds → saves to `memory/raw/` → indexes
+5. If yes → checks for duplicates → embeds → saves to `memory/raw/` → indexes as short-term, scoped to the current project
 
 **Both hooks fail silently.** Nothing ever blocks Claude or surfaces errors to you.
 
 ### Why Haiku for the judgment call
 
 Haiku is fast (~1-2s) and costs ~$0.0001 per call. Most responses get filtered by the signal-phrase check and never reach Haiku. For the ones that do, Haiku has the judgment to distinguish a genuine learning from routine output — something no regex can do reliably.
+
+---
+
+## Supersession
+
+When a new memory is semantically close to an existing one (cosine distance < 0.35), Engram supersedes the old memory rather than creating a duplicate. The old entry is marked inactive and linked to the new one. The `why` CLI shows superseded memories in red so you can see the full lineage.
+
+Three distance thresholds govern this:
+
+| Threshold | Distance | Action |
+|---|---|---|
+| Duplicate | < 0.15 | Skip silently — near-identical already exists |
+| Supersede | < 0.35 | Mark old inactive, save updated version |
+| Inject | < 0.75 | Include in context injection |
 
 ---
 
