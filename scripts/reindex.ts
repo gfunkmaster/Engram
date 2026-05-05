@@ -67,8 +67,7 @@ function walkMarkdown(dir: string): string[] {
     for (const entry of readdirSync(dir)) {
       const full = join(dir, entry);
       if (statSync(full).isDirectory()) {
-        // Task 12: skip _purged directory
-        if (entry === '_purged') continue;
+        if (entry === '_purged' || entry === '_rejected') continue;
         files.push(...walkMarkdown(full));
       } else if (entry.endsWith('.md')) {
         files.push(full);
