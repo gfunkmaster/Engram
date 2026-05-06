@@ -4,9 +4,9 @@
  * Do NOT import from scripts/ here — that would be circular.
  */
 
-import Database from 'better-sqlite3';
+import type { DatabaseSync } from 'node:sqlite';
 
-export const CURRENT_VERSION = 3;
+export const CURRENT_VERSION = 4;
 
 // Each migration: [fromVersion, toVersion, sql]
 export const MIGRATIONS: [number, number, string][] = [
@@ -25,10 +25,6 @@ export const MIGRATIONS: [number, number, string][] = [
       superseded_by   INTEGER,
       is_active       INTEGER DEFAULT 1
     );
-    CREATE VIRTUAL TABLE IF NOT EXISTS memory_embeddings USING vec0(
-      id        INTEGER PRIMARY KEY,
-      embedding float[384]
-    );
   `],
   [1, 2, `
     ALTER TABLE memories ADD COLUMN memory_tier     TEXT DEFAULT 'short';
@@ -41,9 +37,12 @@ export const MIGRATIONS: [number, number, string][] = [
   [2, 3, `
     ALTER TABLE memories ADD COLUMN file_hash TEXT;
   `],
+  [3, 4, `
+    ALTER TABLE memories ADD COLUMN embedding BLOB;
+  `],
 ];
 
-export function ensureSchema(db: Database.Database): void {
+export function ensureSchema(db: DatabaseSync): void {
   db.exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL DEFAULT 0);`);
   const row = db.prepare('SELECT version FROM schema_version').get() as { version: number } | undefined;
   if (!row) db.prepare('INSERT INTO schema_version (version) VALUES (0)').run();
@@ -57,6 +56,9 @@ export function ensureSchema(db: Database.Database): void {
         db.prepare('UPDATE schema_version SET version = ?').run(to);
         version = to;
         process.stderr.write(`[Engram] migrated schema v${from} → v${to}\n`);
+        if (from === 3) {
+          process.stderr.write('[Engram] Schema v4: embeddings moved to memories table. Run npm run reindex to rebuild.\n');
+        }
       } catch (e: unknown) {
         // Column already exists errors are OK (idempotent)
         const msg = e instanceof Error ? e.message : String(e);
@@ -66,4 +68,7 @@ export function ensureSchema(db: Database.Database): void {
       }
     }
   }
+
+  // Clean up the old sqlite-vec virtual table if it exists
+  try { db.exec('DROP TABLE IF EXISTS memory_embeddings'); } catch { /* ignore */ }
 }

@@ -4,6 +4,8 @@ import {
   hasSignal,
   stripJsonFences,
   decideSave,
+  cosineDistance,
+  serialize,
   SIGNAL_PHRASES,
   DUPLICATE_THRESHOLD,
   SUPERSESSION_THRESHOLD,
@@ -139,6 +141,27 @@ describe('autoRemember JSON parsing logic', () => {
     }
     // The catch swallows it — we just verify it threw (as the real code catches and returns)
     expect(threw).toBe(true);
+  });
+});
+
+// ─── cosineDistance tests ────────────────────────────────────────────────────
+
+describe('cosineDistance', () => {
+  it('returns 0 for identical vectors', () => {
+    const v = serialize([1, 0, 0, 1]);
+    expect(cosineDistance(v, v)).toBeCloseTo(0);
+  });
+
+  it('returns 1 for orthogonal vectors', () => {
+    const a = serialize([1, 0]);
+    const b = serialize([0, 1]);
+    expect(cosineDistance(a, b)).toBeCloseTo(1);
+  });
+
+  it('returns < 0.5 for similar vectors', () => {
+    const a = serialize([1, 1, 0]);
+    const b = serialize([1, 0.9, 0.1]);
+    expect(cosineDistance(a, b)).toBeLessThan(0.5);
   });
 });
 

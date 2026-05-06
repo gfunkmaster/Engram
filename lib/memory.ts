@@ -3,8 +3,7 @@
  * Shared by scripts, hooks, and the client wrapper.
  */
 
-import Database from 'better-sqlite3';
-import * as sqliteVec from 'sqlite-vec';
+import type { DatabaseSync } from 'node:sqlite';
 import { pipeline } from '@huggingface/transformers';
 import Anthropic from '@anthropic-ai/sdk';
 import { writeFileSync, mkdirSync, existsSync } from 'fs';
@@ -78,8 +77,22 @@ export interface SaveOptions {
 
 export function serialize(vector: number[]): Buffer {
   const buf = Buffer.allocUnsafe(vector.length * 4);
-  new Float32Array(buf.buffer).set(vector);
+  new Float32Array(buf.buffer, buf.byteOffset, vector.length).set(vector);
   return buf;
+}
+
+export function cosineDistance(a: Uint8Array, b: Uint8Array): number {
+  const fa = new Float32Array(a.buffer, a.byteOffset, a.byteLength / 4);
+  const fb = new Float32Array(b.buffer, b.byteOffset, b.byteLength / 4);
+  let dot = 0, magA = 0, magB = 0;
+  for (let i = 0; i < fa.length; i++) {
+    dot += fa[i] * fb[i];
+    magA += fa[i] * fa[i];
+    magB += fb[i] * fb[i];
+  }
+  const mag = Math.sqrt(magA) * Math.sqrt(magB);
+  if (mag === 0) return 1;
+  return 1 - (dot / mag);
 }
 
 export function today(): string {
@@ -176,10 +189,10 @@ export function decideSave(candidates: Array<{ id: number; distance: number }>):
   return 'new';
 }
 
-/** Open the DB, load sqlite-vec, and run schema migrations. */
-function openDb(path: string = DB_PATH, options?: Database.Options): Database.Database {
-  const db = new Database(path, options);
-  sqliteVec.load(db);
+/** Open the DB and run schema migrations. */
+async function openDb(path: string = DB_PATH, options?: { readOnly?: boolean }): Promise<DatabaseSync> {
+  const { DatabaseSync } = await import('node:sqlite');
+  const db = new DatabaseSync(path, { readOnly: options?.readOnly ?? false });
   ensureSchema(db);
   return db;
 }
@@ -199,66 +212,53 @@ export async function search(
   if (!existsSync(DB_PATH)) return [];
 
   const scope = projectScope !== undefined ? projectScope : getProjectScope();
-
   const extractor = await pipeline('feature-extraction', EMBED_MODEL, { dtype: 'fp32' });
   const out = await extractor(query, { pooling: 'mean', normalize: true });
-  const embedding = serialize(Array.from(out.data as Float32Array));
+  const queryEmbedding = serialize(Array.from(out.data as Float32Array));
 
-  // Two separate queries guarantee best results from each tier regardless of mix.
-  // sqlite-vec applies KNN before WHERE filters, so a single combined query can miss
-  // relevant short-term results when long-term memories dominate the top-K candidates.
-  const kPerTier = Math.max(topK * 2, 20);
-  const db = openDb(DB_PATH, { readonly: true });
+  const db = await openDb(DB_PATH, { readOnly: true });
 
-  const SELECT = `
-    SELECT m.id, m.path, m.title, m.topic, m.chunk, m.is_active, m.superseded_by,
-           m.memory_tier, m.project_scope, m.confidence, m.access_count, e.distance
-    FROM memory_embeddings e
-    JOIN memories m ON m.id = e.id
-  `;
+  const SELECT = `SELECT id, path, title, topic, chunk, is_active, superseded_by,
+    memory_tier, project_scope, confidence, access_count, embedding FROM memories`;
 
-  // Query 1: long-term (global, no scope filter)
   const longTerm = db.prepare(`
-    ${SELECT}
-    WHERE e.embedding MATCH ? AND k = ?
-      AND m.is_active = 1 AND m.memory_tier = 'long'
-    ORDER BY e.distance
-  `).all(embedding, kPerTier) as SearchResult[];
+    ${SELECT} WHERE is_active = 1 AND memory_tier = 'long' AND embedding IS NOT NULL
+  `).all() as unknown as (SearchResult & { embedding: Uint8Array })[];
 
-  // Query 2: short-term scoped to current project (or unscoped)
-  const shortTerm = scope !== null
+  const shortTerm = (scope !== null
     ? db.prepare(`
-        ${SELECT}
-        WHERE e.embedding MATCH ? AND k = ?
-          AND m.is_active = 1 AND m.memory_tier = 'short'
-          AND (m.project_scope = ? OR m.project_scope IS NULL)
-        ORDER BY e.distance
-      `).all(embedding, kPerTier, scope) as SearchResult[]
+        ${SELECT} WHERE is_active = 1 AND memory_tier = 'short' AND embedding IS NOT NULL
+          AND (project_scope = ? OR project_scope IS NULL)
+      `).all(scope)
     : db.prepare(`
-        ${SELECT}
-        WHERE e.embedding MATCH ? AND k = ?
-          AND m.is_active = 1 AND m.memory_tier = 'short'
-        ORDER BY e.distance
-      `).all(embedding, kPerTier) as SearchResult[];
+        ${SELECT} WHERE is_active = 1 AND memory_tier = 'short' AND embedding IS NOT NULL
+      `).all()
+  ) as unknown as (SearchResult & { embedding: Uint8Array })[];
 
   db.close();
 
-  // Merge, deduplicate by id, sort by distance
   const seen = new Set<number>();
   const rows: SearchResult[] = [];
-  for (const r of [...longTerm, ...shortTerm].sort((a, b) => a.distance - b.distance)) {
+  for (const r of [...longTerm, ...shortTerm]
+    .map(r => ({ ...r, distance: cosineDistance(queryEmbedding, r.embedding) }))
+    .sort((a, b) => a.distance - b.distance)) {
     if (!seen.has(r.id)) { seen.add(r.id); rows.push(r); }
   }
   const result = rows.slice(0, topK);
 
-  // Write phase — separate write DB only when there are results to track
   if (result.length > 0) {
-    const writeDb = openDb(DB_PATH);
+    const writeDb = await openDb(DB_PATH);
     const now = Math.floor(Date.now() / 1000);
     const update = writeDb.prepare(
       'UPDATE memories SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?'
     );
-    writeDb.transaction(() => { for (const r of result) update.run(now, r.id); })();
+    writeDb.exec('BEGIN');
+    try {
+      for (const r of result) update.run(now, r.id);
+      writeDb.exec('COMMIT');
+    } catch {
+      writeDb.exec('ROLLBACK');
+    }
     writeDb.close();
   }
 
@@ -271,21 +271,20 @@ export async function searchAll(query: string, topK = 20): Promise<SearchResult[
 
   const extractor = await pipeline('feature-extraction', EMBED_MODEL, { dtype: 'fp32' });
   const out = await extractor(query, { pooling: 'mean', normalize: true });
-  const embedding = serialize(Array.from(out.data as Float32Array));
+  const queryEmbedding = serialize(Array.from(out.data as Float32Array));
 
-  const db = openDb(DB_PATH, { readonly: true });
-
-  const rows = db.prepare(`
-    SELECT m.id, m.path, m.title, m.topic, m.chunk, m.is_active, m.superseded_by,
-           m.memory_tier, m.project_scope, m.confidence, m.access_count, e.distance
-    FROM memory_embeddings e
-    JOIN memories m ON m.id = e.id
-    WHERE e.embedding MATCH ? AND k = ?
-    ORDER BY e.distance
-  `).all(embedding, topK) as SearchResult[];
-
+  const db = await openDb(DB_PATH, { readOnly: true });
+  const all = db.prepare(`
+    SELECT id, path, title, topic, chunk, is_active, superseded_by,
+           memory_tier, project_scope, confidence, access_count, embedding
+    FROM memories WHERE embedding IS NOT NULL
+  `).all() as unknown as (SearchResult & { embedding: Uint8Array })[];
   db.close();
-  return rows;
+
+  return all
+    .map(r => ({ ...r, distance: cosineDistance(queryEmbedding, r.embedding) }))
+    .sort((a, b) => a.distance - b.distance)
+    .slice(0, topK);
 }
 
 /** Write a memory to disk, handle supersession, and index. */
@@ -315,52 +314,62 @@ export async function saveMemory(
   const out = await extractor(content, { pooling: 'mean', normalize: true });
   const embedding = serialize(Array.from(out.data as Float32Array));
 
-  // Task 14: single DB connection with WAL mode
-  const db = openDb(DB_PATH);
-  db.pragma('journal_mode = WAL');
+  const db = await openDb(DB_PATH);
+  db.exec('PRAGMA journal_mode = WAL');
 
   try {
     let supersededId: number | null = null;
     let shouldSkip = false;
 
-    // Read + decide inside a transaction
-    db.transaction(() => {
-      const candidates = db.prepare(`
-        SELECT m.id, e.distance FROM memory_embeddings e
-        JOIN memories m ON m.id = e.id
-        WHERE e.embedding MATCH ? AND k = 5 AND m.is_active = 1
-        ORDER BY e.distance
-      `).all(embedding) as Array<{ id: number; distance: number }>;
+    // Read + decide
+    db.exec('BEGIN');
+    try {
+      const existing = db.prepare(`
+        SELECT id, embedding FROM memories WHERE is_active = 1 AND embedding IS NOT NULL
+      `).all() as Array<{ id: number; embedding: Uint8Array }>;
 
-      const decision = decideSave(candidates);
-      if (decision === 'skip') { shouldSkip = true; return; }
-      if (decision !== 'new') { supersededId = (decision as { supersede: number }).supersede; }
-    })();
+      if (existing.length > 0) {
+        const withDist = existing.map(r => ({
+          id: r.id,
+          distance: cosineDistance(embedding, r.embedding),
+        })).sort((a, b) => a.distance - b.distance);
+
+        const decision = decideSave(withDist);
+        if (decision === 'skip') { shouldSkip = true; }
+        else if (decision !== 'new') { supersededId = (decision as { supersede: number }).supersede; }
+      }
+      db.exec('COMMIT');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
 
     if (shouldSkip) return;
 
-    // File I/O outside transaction (unavoidable)
     const filepath = _writeMarkdown(title, topic, content, mergedOpts);
 
-    // Write + supersede inside a transaction
-    db.transaction(() => {
+    db.exec('BEGIN');
+    try {
       const { lastInsertRowid } = db.prepare(`
         INSERT INTO memories
           (path, title, tags, topic, chunk, session_id, source_excerpt,
-           memory_tier, project_scope, confidence, decay_rate, supersedes, is_active, file_hash)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 0.02, ?, 1, NULL)
+           memory_tier, project_scope, confidence, decay_rate, supersedes, is_active, file_hash, embedding)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, 0.02, ?, 1, NULL, ?)
       `).run(
         filepath, title, mergedOpts.tags ?? 'auto', topic, content,
         mergedOpts.sessionId ?? null, mergedOpts.sourceExcerpt ?? null,
-        mergedOpts.tier, mergedOpts.projectScope, supersededId
+        mergedOpts.tier, mergedOpts.projectScope, supersededId, embedding
       );
 
-      db.prepare('INSERT INTO memory_embeddings (id, embedding) VALUES (?, ?)').run(lastInsertRowid, embedding);
-
       if (supersededId !== null) {
-        db.prepare('UPDATE memories SET is_active = 0, superseded_by = ? WHERE id = ?').run(lastInsertRowid, supersededId);
+        db.prepare('UPDATE memories SET is_active = 0, superseded_by = ? WHERE id = ?')
+          .run(Number(lastInsertRowid), supersededId);
       }
-    })();
+      db.exec('COMMIT');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
   } finally {
     db.close();
   }

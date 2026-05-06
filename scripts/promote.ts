@@ -11,8 +11,7 @@
  *   npm run promote -- --min 5    # custom access threshold
  */
 
-import Database from 'better-sqlite3';
-import * as sqliteVec from 'sqlite-vec';
+import { DatabaseSync } from 'node:sqlite';
 import { readFileSync, writeFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -49,8 +48,7 @@ async function main() {
     console.log(`\n${YELLOW}Dry-run mode — pass --apply to commit changes${RESET}\n`);
   }
 
-  const db = new Database(DB_PATH);
-  sqliteVec.load(db);
+  const db = new DatabaseSync(DB_PATH);
 
   const candidates = db.prepare(`
     SELECT id, path, title, topic, project_scope, access_count, confidence, created_at
@@ -59,7 +57,7 @@ async function main() {
       AND memory_tier = 'short'
       AND access_count >= ?
     ORDER BY access_count DESC
-  `).all(threshold) as MemoryRow[];
+  `).all(threshold) as unknown as MemoryRow[];
 
   if (candidates.length === 0) {
     console.log(`${GREY}No short-term memories have reached the promotion threshold (${threshold} accesses).${RESET}\n`);

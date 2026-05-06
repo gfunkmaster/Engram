@@ -9,8 +9,7 @@
  *   npx tsx scripts/reindex.ts
  */
 
-import Database from 'better-sqlite3';
-import * as sqliteVec from 'sqlite-vec';
+import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'crypto';
 import { pipeline } from '@huggingface/transformers';
 import { readFileSync, readdirSync, statSync } from 'fs';
@@ -81,8 +80,7 @@ async function main() {
   console.log('Loading model...');
   const extractor = await pipeline('feature-extraction', MODEL, { dtype: 'fp32' });
 
-  const db = new Database(DB_PATH);
-  sqliteVec.load(db);
+  const db = new DatabaseSync(DB_PATH);
 
   // Task 13: run schema migrations before any table operations
   ensureSchema(db);
@@ -108,42 +106,41 @@ async function main() {
       decay_rate      REAL DEFAULT 0.02,
       access_count    INTEGER DEFAULT 0,
       last_accessed_at INTEGER,
-      file_hash       TEXT
-    );
-
-    CREATE VIRTUAL TABLE IF NOT EXISTS memory_embeddings USING vec0(
-      id        INTEGER PRIMARY KEY,
-      embedding float[384]
+      file_hash       TEXT,
+      embedding       BLOB
     );
   `);
 
-  // Task 11: INSERT includes confidence and access_count
+  // Task 11: INSERT includes confidence, access_count, and embedding
   const insertMemory = db.prepare(`
     INSERT INTO memories
       (path, title, tags, topic, chunk, session_id, is_active, memory_tier, project_scope,
-       confidence, access_count, file_hash)
-    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+       confidence, access_count, file_hash, embedding)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
   `);
-  const insertEmbedding = db.prepare(
-    'INSERT INTO memory_embeddings (id, embedding) VALUES (?, ?)'
-  );
 
   const files = walkMarkdown(MEMORY_DIR);
   console.log(`Indexing ${files.length} files...\n`);
 
   // Task 12: upsert — check file_hash before processing
-  const insertBatch = db.transaction((rows: MemoryRow[], embeddings: Buffer[]) => {
-    for (let i = 0; i < rows.length; i++) {
-      const r = rows[i];
-      const { lastInsertRowid } = insertMemory.run(
-        r.path, r.title, r.tags, r.topic, r.chunk, r.session_id,
-        r.memory_tier, r.project_scope, r.confidence, r.access_count, r.file_hash
-      );
-      insertEmbedding.run(lastInsertRowid, embeddings[i]);
+  const insertBatch = (rows: MemoryRow[], embeddings: Buffer[]) => {
+    db.exec('BEGIN');
+    try {
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        insertMemory.run(
+          r.path, r.title, r.tags, r.topic, r.chunk, r.session_id,
+          r.memory_tier, r.project_scope, r.confidence, r.access_count,
+          r.file_hash, embeddings[i]
+        );
+      }
+      db.exec('COMMIT');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
     }
-  });
+  };
 
-  const deleteEmbeddingsByIds = db.prepare('DELETE FROM memory_embeddings WHERE id IN (SELECT id FROM memories WHERE path = ?)');
   const deleteMemoryByPath = db.prepare('DELETE FROM memories WHERE path = ?');
   const getExistingHash = db.prepare('SELECT file_hash FROM memories WHERE path = ? LIMIT 1');
   // Reactivate memories in OTHER files that were superseded by a row we're about to delete.
@@ -177,7 +174,6 @@ async function main() {
       // File changed — reactivate any memories superseded by our old rows (prevent dangling refs),
       // then delete old rows and reinsert.
       reactivateOrphans.run(relPath, relPath);
-      deleteEmbeddingsByIds.run(relPath);
       deleteMemoryByPath.run(relPath);
       updated++;
     } else {
